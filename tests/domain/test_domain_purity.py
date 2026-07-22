@@ -68,14 +68,23 @@ class TestDomainPurity(unittest.TestCase):
                     f"{path.name} contains forbidden pattern '{pattern}'",
                 )
 
-    def test_no_v1_imports_anywhere_in_v2(self):
+    def test_no_v1_imports_outside_infra(self):
+        """Only the infra layer may wrap V1 (`src/`). Architecture §4 + Roadmap
+        Phase 2: `infra` is the anti-corruption boundary that delegates to V1's
+        proven I/O; every other v2 layer — domain now, and later analysis /
+        lifecycle / app — must not import `src/` at all. (Before the infra
+        layer existed this check spanned all of v2/; it is now scoped to the
+        pure layers, which is the precise architectural rule.)"""
         v2_dir = DOMAIN_DIR.parent
+        infra_dir = v2_dir / "infra"
         for path in sorted(v2_dir.rglob("*.py")):
+            if infra_dir in path.parents:
+                continue
             source = path.read_text(encoding="utf-8")
             for line_no, module in iter_imports(source):
                 self.assertNotEqual(
                     module.split(".")[0], "src",
-                    f"{path}:{line_no} imports V1 code ('{module}')",
+                    f"{path}:{line_no} imports V1 code ('{module}') outside infra",
                 )
 
 
