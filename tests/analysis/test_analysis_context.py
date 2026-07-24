@@ -37,23 +37,32 @@ def make_snapshot(symbol: str = "TEST/USDT") -> MarketSnapshot:
 
 
 class TestConstruction(unittest.TestCase):
+    # snapshot + session_active are injected inputs, not derived stage products.
+    _INPUTS = {"snapshot", "session_active"}
+
     def test_initial_holds_input_and_nothing_derived(self):
         snapshot = make_snapshot()
         context = AnalysisContext.initial(snapshot)
         self.assertIs(context.snapshot, snapshot)
         derived = [
-            f.name for f in dataclasses.fields(context) if f.name != "snapshot"
+            f.name for f in dataclasses.fields(context) if f.name not in self._INPUTS
         ]
         for name in derived:
             with self.subTest(field=name):
                 self.assertIsNone(getattr(context, name))
 
+    def test_session_active_defaults_false_and_is_injectable(self):
+        self.assertFalse(AnalysisContext.initial(make_snapshot()).session_active)
+        self.assertTrue(
+            AnalysisContext.initial(make_snapshot(), session_active=True).session_active
+        )
+
     def test_has_a_field_per_pipeline_stage(self):
         field_names = {f.name for f in dataclasses.fields(AnalysisContext)}
         expected = {
-            "snapshot", "htf", "regime", "swing_highs", "swing_lows",
-            "atr_last", "displacement_valid", "volume_spike", "sweep",
-            "order_blocks", "fvg", "entry", "risk", "candidate", "signal",
+            "snapshot", "session_active", "htf", "regime", "swing_highs",
+            "swing_lows", "atr_last", "displacement_valid", "volume_spike",
+            "sweep", "order_blocks", "fvg", "entry", "risk", "candidate", "signal",
         }
         self.assertEqual(field_names, expected)
 

@@ -32,9 +32,14 @@ from typing import Optional
 
 from v2.analysis.context import AnalysisContext
 from v2.analysis.pipeline import AnalysisPipeline
+from v2.analysis.scoring import enrich_with_m5
 from v2.domain import MarketSnapshot, Signal
 
 __all__ = ["V2Analyzer", "AnalysisError"]
+
+# V1 requests M5 enrichment only at its decision gate: score >= 8
+# (main.py:352). Mirrors the same gate the regression oracle applies.
+_M5_SCORE_GATE = 8
 
 
 class AnalysisError(Exception):
@@ -62,20 +67,40 @@ class V2Analyzer:
         return self._pipeline
 
     def analyze(
-        self, snapshot: MarketSnapshot, *, prior: Optional[Signal] = None
+        self,
+        snapshot: MarketSnapshot,
+        *,
+        prior: Optional[Signal] = None,
+        session_active: bool = False,
     ) -> Signal:
         """Run the analysis chain over `snapshot` and return its `Signal`.
 
+        The pipeline produces the pre-M5 Signal (mirroring V1's
+        `build_signal_context`); this method then applies the M5 re-score under
+        V1's exact gate — `score >= 8` and an M5 frame present — exactly as V1's
+        `run()` loop invokes `enrich_with_m5` after building the context. That
+        one conditional is the analysis-layer counterpart of V1's own two-call
+        structure, not business logic leaking into the engine.
+
+        `session_active` is the injected session flag (V1's `get_session_mode()
+        == "SNIPER"`, a wall-clock read analysis must not perform); it drives the
+        scoring session bonus and the M5 swing parameters, defaulting to False.
+
         `prior` is accepted for interface compatibility and is intentionally
-        unused — see the module docstring. Raises `AnalysisError` if the
-        pipeline completes without producing a Signal.
+        unused — see the module docstring. Raises `AnalysisError` if the pipeline
+        completes without producing a Signal.
         """
-        context = AnalysisContext.initial(snapshot)
+        context = AnalysisContext.initial(snapshot, session_active=session_active)
         context = self._pipeline.run(context)
 
-        if context.signal is None:
+        signal = context.signal
+        if signal is None:
             raise AnalysisError(
                 "analysis pipeline completed without producing a Signal "
                 f"(stages: {self._pipeline.stage_names})"
             )
-        return context.signal
+
+        if signal.score >= _M5_SCORE_GATE and snapshot.m5 is not None:
+            signal = enrich_with_m5(signal, snapshot.m5, session_active=session_active)
+
+        return signal

@@ -28,15 +28,12 @@ EXPECTED_STAGE_ORDER = (
     "scoring",
 )
 
-# Stages whose behavior has been ported. Extend this as each phase lands, so the
-# "no behavior yet" guarantee keeps protecting every stage still to come.
-IMPLEMENTED_STAGES = frozenset(
-    {"htf", "regime", "structure", "liquidity", "order_block", "fair_value_gap",
-     "entry", "risk"}
-)  # Phases 3.1-3.8
+# Every stage is now ported (Phases 3.1-3.9 complete); the pipeline runs
+# end-to-end and produces a Signal.
+IMPLEMENTED_STAGES = frozenset(EXPECTED_STAGE_ORDER)
 
 FIRST_UNIMPLEMENTED = next(
-    name for name in EXPECTED_STAGE_ORDER if name not in IMPLEMENTED_STAGES
+    (name for name in EXPECTED_STAGE_ORDER if name not in IMPLEMENTED_STAGES), None
 )
 
 
@@ -83,15 +80,9 @@ class TestStagesHaveNoBehavior(unittest.TestCase):
     """Every stage not yet ported must still be unimplemented — the guarantee
     that a milestone implemented only what it claimed."""
 
-    def test_unported_stages_raise_not_implemented(self):
-        context = AnalysisContext.initial(make_snapshot())
-        for stage in default_stages():
-            if stage.name in IMPLEMENTED_STAGES:
-                continue
-            with self.subTest(stage=stage.name):
-                with self.assertRaises(NotImplementedError) as caught:
-                    stage.run(context)
-                self.assertIn(stage.name, str(caught.exception))
+    def test_all_stages_are_ported(self):
+        # Phase 3.9 is the final analysis milestone: nothing remains unported.
+        self.assertIsNone(FIRST_UNIMPLEMENTED)
 
     def test_ported_stages_run(self):
         context = AnalysisContext.initial(make_snapshot())
@@ -159,12 +150,13 @@ class TestV2Analyzer(unittest.TestCase):
         with self.assertRaises(AnalysisError):
             analyzer.analyze(self.snapshot)
 
-    def test_default_pipeline_fails_at_the_first_unported_stage(self):
-        # Proves the engine is wired to the pipeline and enters it in order:
-        # ported stages run, and the chain stops at the first one that is not.
-        with self.assertRaises(NotImplementedError) as caught:
-            V2Analyzer().analyze(self.snapshot)
-        self.assertIn(FIRST_UNIMPLEMENTED, str(caught.exception))
+    def test_default_pipeline_runs_end_to_end_to_a_signal(self):
+        # With every stage ported, the canonical pipeline completes. The minimal
+        # snapshot is too short for an HTF map, so it resolves to an early SKIP.
+        signal = V2Analyzer().analyze(self.snapshot)
+        self.assertIsInstance(signal, Signal)
+        self.assertEqual(signal.decision, "SKIP")
+        self.assertEqual(signal.reason, "invalid_input")
 
     def test_prior_is_accepted_but_never_reaches_the_pipeline(self):
         # `prior` exists for interface compatibility only (Phase 3 DoD: analysis

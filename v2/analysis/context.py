@@ -62,6 +62,13 @@ class AnalysisContext:
     # -- input (always present) --
     snapshot: MarketSnapshot
 
+    # -- injected analysis input --
+    # V1 reads `session_active` from the wall clock (`get_session_mode()`,
+    # strategy.py:1690); analysis must stay clock-free, so it is injected as
+    # data. It drives the scoring session bonus and the M5 swing parameters.
+    # Default False = V1's STRICT session (the conservative default).
+    session_active: bool = False
+
     # -- stage products, in pipeline order --
     htf: Optional[HTFContext] = None
     regime: Optional[Regime] = None
@@ -84,9 +91,16 @@ class AnalysisContext:
     signal: Optional[Signal] = None
 
     @classmethod
-    def initial(cls, snapshot: MarketSnapshot) -> "AnalysisContext":
-        """The entry state: the input and nothing derived yet."""
-        return cls(snapshot=snapshot)
+    def initial(
+        cls, snapshot: MarketSnapshot, *, session_active: bool = False
+    ) -> "AnalysisContext":
+        """The entry state: the input and nothing derived yet.
+
+        `session_active` is the injected session flag (V1's `get_session_mode()
+        == "SNIPER"`); it defaults to False and is threaded unchanged through the
+        pipeline for the scoring stage to read.
+        """
+        return cls(snapshot=snapshot, session_active=session_active)
 
     def with_(self, **changes: object) -> "AnalysisContext":
         """Return a new context with `changes` applied — the single enrichment
