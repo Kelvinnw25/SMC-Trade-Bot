@@ -31,8 +31,9 @@ EXPECTED_STAGE_ORDER = (
 # Stages whose behavior has been ported. Extend this as each phase lands, so the
 # "no behavior yet" guarantee keeps protecting every stage still to come.
 IMPLEMENTED_STAGES = frozenset(
-    {"htf", "regime", "structure", "liquidity", "order_block", "fair_value_gap"}
-)  # Phases 3.1-3.6
+    {"htf", "regime", "structure", "liquidity", "order_block", "fair_value_gap",
+     "entry"}
+)  # Phases 3.1-3.7
 
 FIRST_UNIMPLEMENTED = next(
     name for name in EXPECTED_STAGE_ORDER if name not in IMPLEMENTED_STAGES
