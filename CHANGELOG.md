@@ -140,6 +140,134 @@ Timeline is compressed (the foundation was laid over ~2 days, 2026-07-22 →
   `CHANGELOG.md` (engineering history) were created at the repo root.
 - **Status:** ✅ Complete (living documents; update at every milestone).
 
+### M5 — Phase 3: Pure Analysis Layer (`v2/analysis/`)
+- **Date:** 2026-07-24
+- **Purpose:** Port V1's analysis — the hardest, highest-leverage code — into
+  decomposed, **stateless, pure** modules: `MarketSnapshot → Signal`, with no
+  memory, persistence, notification, or clock dependency.
+- **What happened:** 14 modules built in pipeline order (`htf`, `regime`,
+  `structure`, `order_block`, `fair_value_gap`, `liquidity`, `entry`, `risk`,
+  `scoring`, plus the `frames` / `stage` / `context` / `pipeline` scaffolding and
+  the `engine` `V2Analyzer` that runs the chain). Each was diffed field-for-field
+  against a **fresh `SMCStrategy` V1 oracle** on synthetic corpora and the
+  committed fixture.
+- **Architecture impact:** The pure business core now exists above infra. The
+  regression harness's `Analyzer` seam was filled by `V2Analyzer` exactly as
+  designed at M3.
+- **Important decisions:** `V2Analyzer.analyze()` **owns the M5 `score≥8`
+  eligibility gate** and the choppy penalty — these are analysis rules, not
+  orchestration (they change a signal's tier, so per Principle 12 they must never
+  leak upward). OB **first-match** selection, RR from the structural entry, and
+  floating-point/arithmetic-order determinism preserved bit-for-bit. `analyze()`
+  returns only the final `Signal` (not the analysis context) — a constraint that
+  later shaped the orchestrator (see M7).
+- **Verification:** 478 tests, incl. V2-vs-V1 diffs on scoring/HTF/entry/risk.
+- **Status:** ✅ Complete · frozen.
+
+### M6 — Phase 4: Lifecycle Core (`v2/lifecycle/`)
+- **Date:** 2026-07-24
+- **Purpose:** Extract every lifecycle responsibility (memory, TTL, decay, kill
+  switch, miss counter, killed-thesis cooldown, slot cap, duplicate suppression,
+  alert-upgrade path) into a **stateful but deterministic** layer driven by the
+  **injected clock** — exactly one implementation of each V1 rule.
+- **What happened:** `config` (V1 defaults), `rules` (ONE copy of every V1
+  predicate — incl. the KILL predicate `is_poi_invalidated` with its full V1
+  quirk set, `math.isfinite` for `np.isfinite`, the `None`-sl→`False` behavior),
+  `memory` (read-only `MemoryView`), `store` (single writer; `apply(decision)`;
+  **pure** `ttl_sweep` returning an eviction decision), and `reconciler` (a
+  verbatim transcription of V1's memory engine:
+  KILL→STALE→cooldown→same-thesis→insert/replace/cap→alert→GUARD/decay→SKIP).
+- **Architecture impact:** Lifecycle sits above analysis; `LifecycleDecision`
+  became the declarative bridge to delivery (ordered mutations + alerts +
+  log_events + killed_theses) — nothing is mutated in place by a caller.
+- **Important decisions:** the KILL predicate is a **lifecycle** rule (per
+  Architecture §3), not analysis; the reconciler needs the *fresh* cycle's HTF
+  biases (V1's `context["htf_map"]`), which later forced the orchestrator's
+  one-pipeline-run design (M7). Silent decay and the mixed-source DECAY log
+  fields (Decision #009) preserved.
+- **Verification:** 58 tests, incl. a **12-seed × 60-cycle × 6-symbol replay**
+  against a byte-transcribed V1 reference (`tests/lifecycle/v1_reference.py`)
+  asserting identical active memory, killed store, alerts, and event sequence;
+  plus a purity test (no IO / wall-clock; predicates only in `rules`).
+- **Status:** ✅ Complete · frozen.
+
+### M7 — Phase 5.1: Thin Orchestrator (`v2/app/orchestrator.py`)
+- **Date:** 2026-07-25
+- **Purpose:** Replace V1's `run()` loop with a **coordination-only** layer:
+  startup, wiring, scan loop, per-symbol error isolation, `session_active` (clock
+  only), and the fetch → analyze → reconcile → apply → dispatch → persist
+  sequence — **with no branch that changes a signal's outcome** (Principle 12).
+- **What happened:** `Orchestrator` with full constructor DI (`create()` wires the
+  real adapters); `startup()` (load → store, swallow-to-empty on
+  `PersistenceError`); `run_cycle()`; `run_forever()`; `_process_symbol` (fetch
+  with M5, data-sufficiency guard, analyze, reconcile, apply); `_end_of_cycle`
+  (TTL sweep → prune → save).
+- **Key design discovery — one pipeline run + one analyze.** Because
+  `V2Analyzer.analyze()` returns only the final `Signal`, but both the kill/stale
+  predicate and the delivery layer need the fresh cycle's `HTFContext` (and the
+  pre-M5 signal), the orchestrator obtains the context via one pure `pipeline.run`
+  and the final Signal via `analyze`. Both are pure functions of the snapshot, so
+  the double evaluation is behavior-neutral — and it keeps the M5 gate inside
+  analysis. Verified against V1: `kill_htf = context.htf if signal.direction is
+  not None else None` reproduces exactly which biases V1's `is_poi_invalidated`
+  saw (present past the direction/veto gate; absent → "CHOPPY").
+- **Sanctioned divergence documented:** V2 always fetches M5 and lets `analyze`
+  decide whether to use it (V1 fetched only past the score gate) — a
+  behavior-neutral I/O cadence difference, not an outcome change.
+- **Verification:** orchestrator tests with injected fakes (no network / FS /
+  Telegram / wall clock); "owns-no-logic" tests prove the reconciler receives the
+  analyzer's Signal and derived inputs straight through.
+- **Status:** ✅ Complete.
+
+### M8 — Phase 5.2: Delivery & Observability (`v2/app/`)
+- **Date:** 2026-07-25
+- **Purpose:** Route the analysis/lifecycle **outputs** to presentation — the
+  dashboard, terminal SCAN/HTF/CONF/RAW + lifecycle logs, the notifier, and the
+  retracement OB-audit JSONL — as **pure presentation + thin routing**, with no
+  business logic entering delivery.
+- **What happened:** `rendering.py` (pure `render_dashboard` / `render_scan` /
+  `render_log_event`, byte-exact to V1's `print` strings incl. emojis and the
+  Indonesian log text); `audit.py` (`assemble_ob_audit` from domain objects only,
+  reusing `lifecycle.rules.levels_valid` — no re-analysis); the orchestrator wired
+  with an injected `writer` and `sleeper`, the OB-audit dedup set, render/dispatch/
+  audit routing, and V1's cadence (0.20s inter-fetch, 30s empty-universe, 60s
+  cycle).
+- **Important discoveries reproduced faithfully:** the RAW-log score is the
+  pre-M5, **pre-choppy** value (`raw.score + 2 if "choppy_penalty" in notes`); the
+  OB-audit carries V1's key-name-mismatch quirks (`location==""`;
+  `window_bounds`/`selected_ob_*`/`current_price` always `None`); a killed symbol
+  skips its SCAN block (V1 `continue`d); the audit dedup key is recorded even when
+  the append surfaces an error (V1 swallowed append failures).
+- **Architecture impact:** completed the `app` layer — coordination + delivery,
+  still holding no signal-deciding branch. `OBAuditRecord` remains an
+  observability contract (Decision #010): orchestrator-assembled, domain schema,
+  infra JSONL sink, never read back into a decision.
+- **Verification:** 60 app tests total (rendering byte-exact, audit payload/quirk,
+  delivery routing/dedup/cadence). Full suite: **763 tests** (one pre-existing
+  calendar-dependent analysis flake, documented in `PROJECT_STATE.md §2`).
+- **Status:** ✅ Complete — **migration is code complete.**
+
+### M9 — Phase 6: Shadow Validation & Cutover Preparation (planning)
+- **Date:** 2026-07-25
+- **Purpose:** Prove V2 is behaviorally identical to V1 under production
+  conditions, then cut over. **Not** a development phase — validation + docs only.
+- **What happened (this milestone):** full architecture + layer-ownership audit
+  (every V1 responsibility has exactly one owner; no duplicated business logic; no
+  layer violation, dependency inversion, circular import, hidden mutable state, or
+  business logic in adapters/orchestrator — all verified); a shadow-validation
+  plan (capture a real golden dataset → run V1 and V2 on identical inputs → diff
+  the full observable field set → zero-divergence pass criterion); a cutover
+  checklist (backup → tag `v2-code-complete` → switch entrypoint → observe →
+  retire V1 → tag `v2-cutover`, with V1 as the rollback path until then); and a
+  repository review (root V1-era scratch scripts and `BLUEPRINT.md`/
+  `MODULE_INTENT.md` are legacy references, not migration code — reported, not
+  deleted). `PROJECT_STATE.md` and this `CHANGELOG.md` brought fully current.
+- **Standing gap:** no real multi-symbol/multi-cycle golden dataset has been
+  captured yet — the committed synthetic fixture is a plumbing check. That capture
+  is the gate for meaningful shadow equivalence.
+- **Status:** 🔄 In progress — validation plan produced; awaiting approval to
+  execute shadow validation and cutover.
+
 ---
 
 ## 3. Architectural Evolution
@@ -158,23 +286,27 @@ V1 Monolith                         main.py + src/  (loop-first; logic grown inw
      ▼  make equivalence measurable BEFORE porting logic
 + Regression Harness      (M3)       tests/regression/  — Golden Oracle, outside runtime
      │
-     ▼  (next)
-+ Analysis Layer          (Phase 3)  v2/analysis/  — pure business logic  ← NOT built
+     ▼  port the hardest layer first, proven against V1
++ Analysis Layer          (M5)       v2/analysis/  — 14 pure modules; MarketSnapshot → Signal  ✅
      │
-     ▼
-+ Lifecycle Layer         (Phase 4)  v2/lifecycle/ — stateful reconciler  ← NOT built
+     ▼  add deterministic state on the injected clock
++ Lifecycle Layer         (M6)       v2/lifecycle/ — stateful reconciler + rules + store  ✅
      │
-     ▼
-+ Orchestrator + Delivery (Phase 5)  v2/app/       — thin coordination    ← NOT built
+     ▼  grow the loop outward — coordination only
++ Orchestrator            (M7)       v2/app/orchestrator.py  — thin fetch→analyze→reconcile→persist  ✅
      │
-     ▼
-+ Parallel Validation & Cutover (Phase 6)          — shadow-diff, retire V1
+     ▼  route outputs to presentation/sinks
++ Delivery & Observability(M8)       v2/app/rendering.py · audit.py  — pure presentation + routing  ✅
+     │
+     ▼  (current)
++ Shadow Validation & Cutover (M9/Phase 6)          — shadow-diff to zero divergence, retire V1
 ```
 
 The build order is the **inverse of how V1 grew**: V1 started with the loop and
 grew logic inward; V2 builds the pure, provable core first and grows the loop
 outward. Each layer is real and tested before the layer above it consumes it —
-no stubs hiding behavioral gaps.
+no stubs hiding behavioral gaps. **All layers now exist** — the migration is code
+complete; only shadow validation and cutover (Phase 6) remain.
 
 ---
 
@@ -245,9 +377,13 @@ Only major structural changes are listed.
 | M2 | **+ `v2/infra/`**, **+ `tests/infra/`** |
 | M3 | **+ `tests/regression/`** (with `fixtures/`, `README.md`, committed golden) |
 | M4 | **+ `PROJECT_STATE.md`**, **+ `CHANGELOG.md`** (repo root) |
+| M5 | **+ `v2/analysis/`** (14 modules), **+ `tests/analysis/`** |
+| M6 | **+ `v2/lifecycle/`**, **+ `tests/lifecycle/`** (incl. `v1_reference.py`) |
+| M7–M8 | **+ `v2/app/`** (`orchestrator.py`, `rendering.py`, `audit.py`), **+ `tests/app/`** |
 
-`v2/analysis/`, `v2/lifecycle/`, `v2/app/` do **not** exist yet — they arrive with
-Phases 3–5.
+All five V2 layers (`domain`, `infra`, `analysis`, `lifecycle`, `app`) now exist.
+The repository also became a **git repository** (branch `main`, per-phase commits,
+tag `v0.1.0`) — the version-control safety net the earlier checkpoints lacked.
 
 ---
 
@@ -269,14 +405,26 @@ Infra tests       adapter fidelity with injected fakes — no network,
 Regression        observable-equivalence machinery + V1-vs-V1 baseline
 harness (45)      (45/45 fields green) on a deterministic fixture
      │
-     ▼  Phase 3+
-Behavioral        V2 analysis/lifecycle diffed against V1 across the
-validation        golden dataset (zero divergence == done)
+     ▼  M5
+Analysis tests    V2 analysis diffed field-for-field against a fresh
+(478)             SMCStrategy V1 oracle on synthetic corpora + fixture
+     │
+     ▼  M6
+Lifecycle tests   12-seed × 60-cycle × 6-symbol replay vs a byte-transcribed
+(58)              V1 reference — identical memory / killed / alerts / events
+     │
+     ▼  M7–M8
+App tests         orchestrator wiring + byte-exact delivery rendering &
+(60)              routing, all via injected fakes (no I/O, no wall clock)
 ```
+
+Current total: **763 tests** (domain 39 · infra 83 · analysis 478 · lifecycle 58
+· app 60 · regression 45); 762 pass, plus one documented calendar-dependent
+analysis flake (`PROJECT_STATE.md §2`).
 
 Constants throughout: **stdlib `unittest` only** (pytest is not installed and is
 forbidden), and **every test is hermetic** — no external service, temp files
-only. Current total: **167 tests, all passing.**
+only.
 
 ---
 
@@ -290,11 +438,17 @@ only. Current total: **167 tests, all passing.**
 | M2.2 — Market data | ✅ | fidelity tests ✅ | ✅ | ✅ |
 | M2.3 — Persistence | ✅ | fidelity tests ✅ | ✅ | ✅ |
 | M2.4 — Notifier | ✅ | fidelity tests ✅ | ✅ | ✅ |
-| M3 — Regression harness | ✅ | ✅ (V1-vs-V1 baseline) | ✅ | ✅ (pending golden dataset + Phase 3) |
+| M3 — Regression harness | ✅ | ✅ (V1-vs-V1 baseline) | ✅ | ✅ |
+| M5 — Analysis layer | ✅ | ✅ (V2-vs-V1 oracle, synthetic corpora) | ✅ | ✅ |
+| M6 — Lifecycle core | ✅ | ✅ (multi-seed replay vs V1 reference) | ✅ | ✅ |
+| M7 — Thin orchestrator | ✅ | ✅ (wiring/isolation via fakes) | — | ✅ |
+| M8 — Delivery & observability | ✅ | ✅ (byte-exact rendering + routing) | — | ✅ (code complete) |
 
 "Regression complete" for M2 means *adapter-fidelity* tests (behavior against
-injected V1-shaped data), not golden-dataset diffing — that begins at Phase 3,
-which is what M3 was built to enable.
+injected V1-shaped data), not golden-dataset diffing — that begins at M5. For M5+
+it means V2 diffed against V1's unmodified functions on **synthetic/committed**
+inputs; **end-to-end shadow diffing over a real captured golden dataset remains
+the outstanding Phase-6 step** (see §9).
 
 ---
 
@@ -340,17 +494,16 @@ Distilled so future contributors don't relearn them the hard way:
 Straight from `SMC-BOT-DOCS/03-implementation-roadmap.md` — **no speculation, no
 redesign proposals**:
 
+- [x] **Phase 3 — Pure Analysis Layer** (`v2/analysis/`) — M5.
+- [x] **Phase 4 — Lifecycle Core** (`v2/lifecycle/`) — M6.
+- [x] **Phase 5 — Orchestration & Delivery Wiring** (`v2/app/`) — M7 (orchestrator)
+      + M8 (delivery & observability).
 - [ ] **Golden dataset capture** — real multi-symbol, multi-cycle V1 recordings
-      across diverse market conditions (prerequisite for meaningful Phase 3).
-- [ ] **Phase 3 — Pure Analysis Layer** (`v2/analysis/`): port
-      `build_signal_context` / `score_signal` / entry / risk / structure into
-      pure modules; `MarketSnapshot → Signal`.
-- [ ] **Phase 4 — Lifecycle Core** (`v2/lifecycle/`): reconciler + rules + store,
-      driven by the injected clock.
-- [ ] **Phase 5 — Orchestration & Delivery Wiring** (`v2/app/`): a thin
-      orchestrator with no signal-deciding logic.
-- [ ] **Phase 6 — Parallel Validation & Cutover**: shadow-mode diff to zero
-      divergence, then retire V1.
+      across diverse market conditions (still outstanding; the gate for meaningful
+      shadow validation — the committed synthetic fixture is a plumbing check only).
+- [ ] **Phase 6 — Shadow Validation & Cutover**: run V1 and V2 on identical inputs,
+      diff the full observable field set to **zero divergence**, then cut over and
+      retire V1. *(Current phase — validation + docs only, no new development.)*
 
 ---
 
@@ -367,12 +520,12 @@ Written specifically for the next AI assistant picking this up cold.
 5. The V1 reference code itself: `src/strategy.py`, then `main.py`.
 
 **How to resume work:** `PROJECT_STATE.md §2` gives the current phase; `§11`
-describes the *only* next milestone. Do **not** start it without explicit
-approval, and do not design beyond it.
+describes Phase 6 (shadow validation + cutover — validation and docs only, no new
+development). Do **not** start cutover without explicit approval.
 
 **How to verify progress before and after any change:**
 ```bash
-venv/Scripts/python.exe -m unittest discover tests    # expect: 167 passing
+venv/Scripts/python.exe -m unittest discover tests    # expect: 763 (1 known flake)
 ```
 For a behavior-bearing phase, additionally require
 `compare_analyzers(snap, V1Oracle(), V2Analyzer()).ok == True` across the golden
