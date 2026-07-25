@@ -79,7 +79,8 @@ def prior_short_alerted() -> ActiveSignal:
 
 
 def make_orch(*, market, analyzer, clock=None, persistence=None, notifier=None,
-              reconciler=None, config=None, top_coins_limit=30):
+              reconciler=None, config=None, top_coins_limit=30, writer=None,
+              sleeper=None):
     return Orchestrator(
         clock=clock or sniper_clock(),
         market_data=market,
@@ -89,6 +90,8 @@ def make_orch(*, market, analyzer, clock=None, persistence=None, notifier=None,
         config=config or LifecycleConfig(),
         top_coins_limit=top_coins_limit,
         reconciler=reconciler,
+        writer=writer or (lambda line: None),
+        sleeper=sleeper or (lambda s: None),
     )
 
 
@@ -365,15 +368,15 @@ class TestRunForever(unittest.TestCase):
         symbol = "BTC/USDT"
         market = FakeMarketData([symbol], {symbol: make_snapshot(symbol)})
         persistence = FakePersistence()
+        sleeps: list = []
         orch = make_orch(
             market=market, analyzer=FakeAnalyzer({symbol: skip_signal(symbol)}),
-            persistence=persistence,
+            persistence=persistence, sleeper=lambda s: sleeps.append(s),
         )
-        sleeps: list = []
-        orch.run_forever(sleeper=lambda s: sleeps.append(s), max_cycles=3)
-        self.assertEqual(persistence.save_calls, 3)   # 3 cycles
-        self.assertEqual(len(sleeps), 2)              # sleeps between, not after last
-        self.assertEqual(persistence.load_calls, 1)   # startup once
+        orch.run_forever(max_cycles=3)
+        self.assertEqual(persistence.save_calls, 3)       # 3 cycles
+        self.assertEqual(sleeps.count(60.0), 2)           # cycle sleeps between, not after last
+        self.assertEqual(persistence.load_calls, 1)       # startup once
 
 
 class TestOwnsNoBusinessLogic(unittest.TestCase):

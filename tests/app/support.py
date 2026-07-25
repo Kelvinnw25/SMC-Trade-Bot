@@ -6,14 +6,23 @@ assert the orchestrator invoked them in the right way (wiring, order, arguments)
 """
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from v2.domain import ActiveSignal, KilledThesisRecord, LifecycleDecision, Signal
+from v2.domain import (
+    ActiveSignal,
+    KilledThesisRecord,
+    LifecycleDecision,
+    OrderBlock,
+    Signal,
+)
 from v2.infra.clock import FakeClock
 from v2.infra.market_data import SymbolVolume
+
+from tests.lifecycle.support import CycleSpec, make_signal
 
 
 # -- clocks -----------------------------------------------------------------
@@ -90,19 +99,25 @@ class FakeMarketData:
 # -- analyzer ---------------------------------------------------------------
 
 class _FakeContext:
-    def __init__(self, htf) -> None:
+    """Duck-typed stand-in for the pre-M5 AnalysisContext the orchestrator reads
+    (only ``.htf`` and ``.signal`` are used)."""
+
+    def __init__(self, htf, signal) -> None:
         self.htf = htf
+        self.signal = signal
 
 
 class _FakePipeline:
-    def __init__(self, htf_by_symbol: Dict[str, Any]) -> None:
-        self._htf_by_symbol = htf_by_symbol
+    def __init__(self, analyzer: "FakeAnalyzer") -> None:
+        self._analyzer = analyzer
         self.runs: List[str] = []
 
     def run(self, context):
         symbol = context.snapshot.symbol
         self.runs.append(symbol)
-        return _FakeContext(self._htf_by_symbol.get(symbol))
+        return _FakeContext(
+            self._analyzer.htf_for(symbol), self._analyzer.pre_m5_for(symbol)
+        )
 
 
 class FakeAnalyzer:
@@ -111,9 +126,12 @@ class FakeAnalyzer:
         signals: Dict[str, Any],
         *,
         htf_by_symbol: Optional[Dict[str, Any]] = None,
+        pre_m5_by_symbol: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._signals = signals
-        self.pipeline = _FakePipeline(htf_by_symbol or {})
+        self._htf = htf_by_symbol or {}
+        self._pre_m5 = pre_m5_by_symbol or {}
+        self.pipeline = _FakePipeline(self)
         self.calls: List[tuple] = []
 
     def analyze(self, snapshot, *, prior: Optional[Signal] = None, session_active: bool = False):
@@ -122,6 +140,20 @@ class FakeAnalyzer:
         if isinstance(value, Exception):
             raise value
         return value
+
+    def htf_for(self, symbol):
+        """The fresh HTF the pipeline would expose. Explicit override, else the
+        signal's candidate HTF (what the real context carries when scored)."""
+        if symbol in self._htf:
+            return self._htf[symbol]
+        signal = self._signals.get(symbol)
+        candidate = getattr(signal, "candidate", None)
+        return candidate.htf if candidate is not None else None
+
+    def pre_m5_for(self, symbol):
+        """The pre-M5 context signal (defaults to the final signal — identical
+        when no M5 enrichment applies)."""
+        return self._pre_m5.get(symbol, self._signals.get(symbol))
 
 
 # -- persistence ------------------------------------------------------------
@@ -134,13 +166,16 @@ class FakePersistence:
         killed: Optional[Dict[str, KilledThesisRecord]] = None,
         load_error: Optional[Exception] = None,
         save_error: Optional[Exception] = None,
+        append_error: Optional[Exception] = None,
     ) -> None:
         self._active_in = active or {}
         self._killed_in = killed or {}
         self.load_error = load_error
         self.save_error = save_error
+        self.append_error = append_error
         self.saved_active: Optional[Dict[str, Any]] = None
         self.saved_killed: Optional[Dict[str, Any]] = None
+        self.ob_audits: List[Any] = []
         self.load_calls = 0
         self.save_calls = 0
         self.default_timestamps: List[Any] = []
@@ -167,6 +202,60 @@ class FakePersistence:
         if self.save_error is not None:
             raise self.save_error
         self.saved_killed = dict(theses)
+
+    def append_ob_audit(self, record) -> None:
+        if self.append_error is not None:
+            raise self.append_error
+        self.ob_audits.append(record)
+
+
+# -- writer sink ------------------------------------------------------------
+
+class CapturingWriter:
+    """A terminal sink that records every line, for asserting rendered output."""
+
+    def __init__(self) -> None:
+        self.lines: List[str] = []
+
+    def __call__(self, line: str) -> None:
+        self.lines.append(line)
+
+    def joined(self) -> str:
+        return "\n".join(self.lines)
+
+
+# -- signal builder with a selected OB (for OB-audit routing) ---------------
+
+def retracement_ob_signal(
+    symbol: str = "BTC/USDT",
+    *,
+    direction: str = "LONG",
+    live_price: float = 100.0,
+    sl: float = 95.0,
+    tp: float = 115.0,
+    entry_price: float = 100.0,
+    h1_last_ts: float = 5000.0,
+) -> Signal:
+    """A scored RETRACEMENT signal whose entry is a selected OB — eligible for
+    the OB audit."""
+    signal, _ = make_signal(CycleSpec(
+        symbol=symbol, decision="VALID", direction=direction,
+        entry_mode="RETRACEMENT", regime="expansion_up", score=12,
+        entry_ready=True, entry_price=entry_price, sl=sl, tp=tp,
+        entry_source="retracement_ob", tp_source="SWING_HIGH",
+        d1_bias="BULLISH", h4_bias="BULLISH", weekly_bias="BULLISH",
+        location="discount", atr_last=1.0, volume_spike=True,
+        live_price=live_price, h1_last_ts=h1_last_ts,
+    ))
+    ob = OrderBlock(
+        index=5, rank_from_last=3, top=entry_price, bottom=entry_price - 2.0,
+        size=2.0, fresh_status=True, passed_quality_filter=True,
+        is_selected=True, size_atr=2.0, depth_from_price=0.5,
+    )
+    cand = dataclasses.replace(
+        signal.candidate, order_blocks=(ob,), fresh_ob=True, fvg_valid=True
+    )
+    return dataclasses.replace(signal, candidate=cand)
 
 
 # -- notifier ---------------------------------------------------------------

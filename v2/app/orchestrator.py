@@ -5,44 +5,50 @@ runtime pipeline: fetch → analyze → reconcile → apply → dispatch → per
 Principle 12 (the orchestrator branches only on operational conditions, never on
 anything that changes a signal's outcome, tier, or lifecycle transition).
 
-This module is **coordination only**. It owns the scan loop, dependency wiring,
-the data-sufficiency guard, `session_active` (computed from the injected clock),
-per-symbol error isolation, and the invocation order of the four collaborators
-(market data → analyzer → lifecycle → persistence/notifier). Every *decision* —
-what a signal is, whether it kills/decays/inserts, how an alert is formatted — is
-delegated to the existing components. Nothing here re-implements or duplicates
-their logic.
+This module is **coordination + delivery routing only**. It owns the scan loop,
+dependency wiring, the data-sufficiency guard, `session_active` (from the
+injected clock), per-symbol error isolation, the invocation order of the
+collaborators, and — added in Phase 5.2 — routing the analysis/lifecycle
+*outputs* to presentation: the dashboard, the scan/lifecycle terminal logs (via
+`app.rendering`), the notifier (Alerts), and the OB-audit JSONL sink (via
+`app.audit` + `infra.persistence`). Every *decision* is delegated; nothing here
+recomputes analysis or lifecycle logic.
 
 ## Why it does not branch on score for M5
 
 V1 fetched M5 only when the pre-M5 score reached its gate (>= 8). That gate is an
-**analysis** eligibility rule (Arch §5: "the eligibility rule belongs to
-analysis"; `V2Analyzer.analyze` owns it) and a branch that changes the signal's
-tier — so, per Principle 12, it must NOT live here. The orchestrator therefore
-requests the snapshot *with* M5 and lets `analyze` decide whether to use it: the
-produced Signal is identical to V1's, and only the fetch cadence differs (M5 is
-fetched for every symbol rather than post-gate). This is a documented,
-behavior-neutral divergence in I/O cadence, in the same spirit as the adapters'
-error-surfacing divergence — signals, alerts, and lifecycle state are unchanged.
+**analysis** eligibility rule (`V2Analyzer.analyze` owns it) and a branch that
+changes the signal's tier — so, per Principle 12, it must NOT live here. The
+orchestrator requests the snapshot *with* M5 and lets `analyze` decide whether to
+use it: the produced Signal is identical to V1's; only the fetch cadence differs
+(a documented, behavior-neutral I/O divergence, like the adapters' error
+surfacing).
 
-## The fresh HTF the lifecycle kill/stale predicate needs
+## One pipeline run for the observability/kill data, one analyze for the Signal
 
-`lifecycle.reconciler.reconcile` takes the fresh cycle's `HTFContext` (the kill /
-stale predicate reads the fresh D1/H4 biases regardless of the decision tier).
-V1's `is_poi_invalidated` read `context["htf_map"]`, which V1 populated only once
-a direction resolved *or* vetoed — it is ABSENT (→ "CHOPPY") for the
-no_direction / invalid exits. `_kill_htf` reproduces exactly that: the candidate's
-HTF when scored/not-ready, `None` when no direction resolved, and — for the
-candidate-less *veto* case where V1's context still carried `htf_map` — the fresh
-HTF recovered by a single pure `pipeline.run` (no state, no I/O, no M5).
+The frozen `V2Analyzer.analyze` returns only the final Signal — not the analysis
+context. The delivery layer and the lifecycle kill/stale predicate both need the
+fresh cycle's `HTFContext` (and the pre-M5 signal for the RAW log line), which
+live in that context. So the orchestrator obtains the context with one pure
+`pipeline.run` and the final post-M5 Signal with `analyze`. Both are pure
+functions of the snapshot, so the double evaluation is behavior-neutral; it keeps
+the M5 gate inside analysis (no Principle-12 leak) and lets the delivery layer
+read domain objects only (no re-analysis in delivery).
+
+- `kill_htf` (fed to the reconciler) = `context.htf` when a direction resolved or
+  vetoed, else None — reproducing exactly which biases V1's `is_poi_invalidated`
+  saw in `context["htf_map"]` (absent → "CHOPPY" — for the no_direction/invalid
+  exits).
+- the HTF log line uses `context.htf` directly (V1 printed it whenever
+  `debug["htf"]` was set — including no_direction, where the kill predicate still
+  saw CHOPPY). These two are deliberately different, matching V1.
 
 ## Error handling (V1 parity)
 
-V1 swallowed failures and continued: a per-coin `try/except` skipped a bad
-symbol, an empty universe was retried, and load/save/notify failures were
-printed and ignored. The V2 adapters *surface* those as typed exceptions (the one
-sanctioned divergence); this orchestrator re-applies V1's swallow-and-continue
-policy at the edge, so lifecycle behavior is unchanged.
+The adapters *surface* failures as typed exceptions (the one sanctioned
+divergence); this orchestrator re-applies V1's swallow-and-continue policy at the
+edge (per-symbol skip, empty-universe retry, load/save/notify best-effort), so
+lifecycle behavior is unchanged.
 """
 from __future__ import annotations
 
@@ -51,7 +57,9 @@ from typing import Callable, Optional
 
 from v2.analysis.context import AnalysisContext
 from v2.analysis.engine import V2Analyzer
-from v2.domain import HTFContext, LifecycleDecision, Signal
+from v2.app.audit import AUDIT_ENTRY_MODE, assemble_ob_audit
+from v2.app.rendering import render_dashboard, render_log_event, render_scan
+from v2.domain import LifecycleDecision, Signal
 from v2.infra.clock import Clock, SystemClock
 from v2.infra.market_data import MarketDataAdapter, MarketDataError
 from v2.infra.notifier import Notifier, NotifierError, TelegramNotifier
@@ -60,22 +68,24 @@ from v2.lifecycle import LifecycleConfig, Reconciler, SignalStore
 
 __all__ = ["Orchestrator"]
 
-# Operational constants (V1 config / run() literals). Orchestrator-owned because
-# they gate *coordination*, not signal outcomes.
-_TOP_COINS_LIMIT = 30       # config.TOP_COINS_LIMIT
-_D1_MIN_ROWS = 10           # main.py:291 (len(df_d1) < 10 -> skip)
-_H1_MIN_ROWS = 50           # main.py:291 (len(df_h1) < 50 -> skip)
-_CYCLE_SLEEP_SECONDS = 60.0  # main.py:782 (sleep 60 between cycles)
+# Operational constants (V1 config / run() literals) — they gate *coordination*,
+# not signal outcomes.
+_TOP_COINS_LIMIT = 30            # config.TOP_COINS_LIMIT
+_D1_MIN_ROWS = 10               # main.py:291 (len(df_d1) < 10 -> skip)
+_H1_MIN_ROWS = 50               # main.py:291 (len(df_h1) < 50 -> skip)
+_CYCLE_SLEEP_SECONDS = 60.0     # main.py:782 (sleep 60 between cycles)
+_EMPTY_SLEEP_SECONDS = 30.0     # main.py:274 (sleep 30 on empty universe)
+_FETCH_PAUSE_SECONDS = 0.20     # main.py:280/283/353 (inter-fetch rate limit)
 
 
 class Orchestrator:
     """Coordinates one scan cycle (and the loop) across the V2 components.
 
     All collaborators are injected (constructor DI, Arch A6): tests supply fakes
-    and never touch the network, filesystem, or Telegram; `create()` builds the
-    production wiring. The lifecycle `Reconciler` is injectable but defaults to a
-    real one over the injected clock; the `SignalStore` is created at
-    :meth:`startup` from the persisted memory (it *is* that memory).
+    and never touch the network, filesystem, Telegram, or the wall clock;
+    `create()` builds the production wiring. `writer` is the terminal sink
+    (default `print`); `sleeper` is the cadence sink (default `time.sleep`) —
+    both injected so tests observe output/cadence without side effects.
     """
 
     def __init__(
@@ -89,6 +99,11 @@ class Orchestrator:
         config: LifecycleConfig = LifecycleConfig(),
         top_coins_limit: int = _TOP_COINS_LIMIT,
         reconciler: Optional[Reconciler] = None,
+        writer: Callable[[str], None] = print,
+        sleeper: Callable[[float], None] = time.sleep,
+        fetch_pause_seconds: float = _FETCH_PAUSE_SECONDS,
+        cycle_pause_seconds: float = _CYCLE_SLEEP_SECONDS,
+        empty_pause_seconds: float = _EMPTY_SLEEP_SECONDS,
     ) -> None:
         self._clock = clock
         self._market = market_data
@@ -98,7 +113,15 @@ class Orchestrator:
         self._config = config
         self._top_coins_limit = top_coins_limit
         self._reconciler = reconciler or Reconciler(clock, config)
+        self._writer = writer
+        self._sleeper = sleeper
+        self._fetch_pause = fetch_pause_seconds
+        self._cycle_pause = cycle_pause_seconds
+        self._empty_pause = empty_pause_seconds
         self._store: Optional[SignalStore] = None
+        # V1's in-memory `ob_audit_seen`: per-process, resets on restart
+        # (Decision #010 — orchestrator-owned transient dedup state).
+        self._ob_audit_seen: set = set()
 
     # -- production wiring --------------------------------------------------
 
@@ -122,12 +145,11 @@ class Orchestrator:
     # -- startup ------------------------------------------------------------
 
     def startup(self) -> None:
-        """Load persisted memory into a fresh `SignalStore` (Arch §5 startup 1-2).
+        """Load persisted memory into a fresh `SignalStore` (Arch §5 startup).
 
         Reproduces V1's `load_memory` / `load_killed_thesis`, including their
-        swallow-to-empty behavior: the adapter *surfaces* a malformed store as
-        `PersistenceError`; V1's policy was to start empty, so that is applied
-        here. A missing file already yields an empty mapping (no error)."""
+        swallow-to-empty behavior on a malformed store (the adapter surfaces
+        `PersistenceError`; V1's policy was to start empty)."""
         try:
             active = self._persistence.load_active_signals(
                 default_timestamp=self._clock.timestamp()
@@ -141,55 +163,48 @@ class Orchestrator:
 
     # -- one scan cycle -----------------------------------------------------
 
-    def run_cycle(self) -> None:
-        """One full scan cycle: fetch universe → per-symbol reconcile → maintain
-        → persist (Arch §5 steps 3-5). Mirrors one iteration of V1's `run()`
-        loop body."""
+    def run_cycle(self) -> bool:
+        """One full scan cycle. Returns True if the universe was processed,
+        False on an empty/failed universe (V1's `if not top_coins: continue`,
+        which skipped maintenance and saving that cycle)."""
         if self._store is None:
             self.startup()
 
         try:
             universe = self._market.get_top_volume_symbols(self._top_coins_limit)
         except MarketDataError:
-            # V1: get_top_volume_coins returns [] on failure -> `if not
-            # top_coins: continue` (no maintenance, no save that cycle).
-            return
+            return False
 
         if not universe:
-            return
+            return False
 
         for entry in universe:
             self._process_symbol(entry.symbol)
 
         self._end_of_cycle()
+        return True
 
-    def run_forever(
-        self,
-        *,
-        sleeper: Callable[[float], None] = time.sleep,
-        cycle_interval: float = _CYCLE_SLEEP_SECONDS,
-        max_cycles: Optional[int] = None,
-    ) -> None:
-        """The production scan loop (Arch §5 step 6). `sleeper` and `max_cycles`
-        are injected so tests bound and observe the loop without real sleeping;
-        the inter-cycle sleep is cadence only and reads no clock."""
+    def run_forever(self, *, max_cycles: Optional[int] = None) -> None:
+        """The production scan loop (Arch §5 step 6; main.py:267-782). Sleeps 60s
+        between full cycles and 30s after an empty universe (V1's cadence), via
+        the injected `sleeper`. `max_cycles` bounds it for tests."""
         self.startup()
         count = 0
         while max_cycles is None or count < max_cycles:
-            self.run_cycle()
+            processed = self.run_cycle()
             count += 1
             if max_cycles is not None and count >= max_cycles:
                 break
-            sleeper(cycle_interval)
+            self._sleeper(self._cycle_pause if processed else self._empty_pause)
 
     # -- per symbol ---------------------------------------------------------
 
     def _process_symbol(self, symbol: str) -> None:
-        """Analyze one symbol and reconcile it, isolated from the rest of the
-        scan. Any failure (a surfaced infra error, or an unexpected one) skips
-        just this symbol — V1's per-coin `try/except ... continue` (main.py:
-        766-768). Terminal logging of the failure is Phase 5.2."""
+        """Analyze one symbol, reconcile it, and route its output — isolated
+        from the rest of the scan. Any failure skips just this symbol (V1's
+        per-coin `try/except ... continue`, main.py:766-768)."""
         try:
+            self._sleeper(self._fetch_pause)  # V1 inter-fetch rate limit (cadence)
             snapshot = self._market.get_market_snapshot(symbol, include_m5=True)
             if snapshot is None:
                 return  # V1: D1/H1 None/empty -> continue
@@ -197,77 +212,102 @@ class Orchestrator:
                 return  # V1: data-sufficiency guard (main.py:291)
 
             session_active = self._session_active()
+            context = self._analyzer.pipeline.run(
+                AnalysisContext.initial(snapshot, session_active=session_active)
+            )
             signal = self._analyzer.analyze(snapshot, session_active=session_active)
-            htf = self._kill_htf(snapshot, signal, session_active)
 
+            # kill/stale predicate biases: present only when a direction resolved
+            # or vetoed (V1's context["htf_map"]); None -> "CHOPPY".
+            kill_htf = context.htf if signal.direction is not None else None
             decision = self._reconciler.reconcile(
                 signal,
                 self._store.view(),
-                htf=htf,
+                htf=kill_htf,
                 live_price=snapshot.live_price,
                 h1_last_ts=snapshot.h1_last_ts,
             )
             self._store.apply(decision)
+
+            self._render_symbol(signal, context, decision)
             self._dispatch(decision)
+            self._audit(snapshot, signal, decision)
         except Exception:
-            # Per-symbol isolation: one bad symbol must not end the scan.
             return
 
+    def _render_symbol(self, signal: Signal, context, decision: LifecycleDecision) -> None:
+        """Terminal output for one symbol: the SCAN block (unless the symbol was
+        killed — V1 `continue`d before printing it), then the lifecycle logs, in
+        V1's order."""
+        killed = any(le.event_type == "KILL" for le in decision.log_events)
+        if not killed:
+            for line in render_scan(signal, context.htf, context.signal):
+                self._writer(line)
+        for event in decision.log_events:
+            self._writer(render_log_event(event))
+
     def _dispatch(self, decision: LifecycleDecision) -> None:
-        """Route the decision's Alerts to the notifier (Arch §9: lifecycle
-        decides, delivery executes). V1 marked signals alerted regardless of
-        send success, so a `NotifierError` is swallowed (best-effort delivery) —
-        the store already carries the alert metadata the reconciler baked in.
-        LogEvent terminal delivery is Phase 5.2."""
+        """Route the decision's Alerts to the notifier (Arch §9). V1 marked
+        signals alerted regardless of send success, so a `NotifierError` is
+        swallowed (best-effort delivery)."""
         for alert in decision.alerts:
             try:
                 self._notifier.send(alert)
             except NotifierError:
                 continue
 
+    def _audit(
+        self, snapshot, signal: Signal, decision: LifecycleDecision
+    ) -> None:
+        """Assemble and append the retracement OB-audit line (Decision #010).
+
+        V1 wrote it only when the symbol was neither killed nor stale (it
+        `continue`d before the audit in both cases). The eligibility + payload
+        come from `app.audit`; the dedup set is orchestrator-owned; the write is
+        the persistence sink. V1 adds the dedup key regardless of write success
+        (its append swallows failures), so the key is recorded even if the
+        surfaced append fails."""
+        if any(le.event_type in ("KILL", "STALE") for le in decision.log_events):
+            return
+        record = assemble_ob_audit(snapshot, signal)
+        if record is None:
+            return
+        key = (snapshot.symbol, snapshot.h1_last_ts, AUDIT_ENTRY_MODE)
+        if key in self._ob_audit_seen:
+            return
+        try:
+            self._persistence.append_ob_audit(record)
+        except PersistenceError:
+            pass
+        self._ob_audit_seen.add(key)
+
     # -- coordination helpers ----------------------------------------------
 
     def _session_active(self) -> bool:
-        """V1's `get_session_mode() == "SNIPER"` (strategy.py:14-19), computed
-        from the injected clock instead of the wall clock: SNIPER is a weekday
-        (Mon-Fri) between 07:00 and 22:00 UTC; everything else is STRICT."""
+        """V1's `get_session_mode() == "SNIPER"` (strategy.py:14-19) from the
+        injected clock: a weekday (Mon-Fri) between 07:00 and 22:00 UTC."""
         now = self._clock.now()
         return now.weekday() < 5 and 7 <= now.hour < 22
-
-    def _kill_htf(
-        self, snapshot, signal: Signal, session_active: bool
-    ) -> Optional[HTFContext]:
-        """The fresh `HTFContext` the lifecycle kill/stale predicate must see —
-        reproducing which biases V1's `is_poi_invalidated` read from
-        `context["htf_map"]` (present only past the direction gate):
-
-        - scored / not-ready (candidate present): the candidate's HTF;
-        - no_direction / invalid (`direction is None`): None — V1's context
-          carried no `htf_map` there, so the predicate saw "CHOPPY";
-        - veto (candidate-less but `direction` set): V1's context DID carry
-          `htf_map`, so recover the fresh HTF via one pure `pipeline.run` (no M5,
-          no state) — the analysis layer's own output, not a re-derivation here.
-        """
-        if signal.candidate is not None:
-            return signal.candidate.htf
-        if signal.direction is None:
-            return None
-        context = self._analyzer.pipeline.run(
-            AnalysisContext.initial(snapshot, session_active=session_active)
-        )
-        return context.htf
 
     # -- end of cycle -------------------------------------------------------
 
     def _end_of_cycle(self) -> None:
-        """TTL sweep → killed-thesis prune → persist (Arch §5 step 5; main.py:
-        770-779). Dashboard rendering is Phase 5.2. A save failure is swallowed
-        (V1's `save_memory` try/except printed and continued)."""
+        """TTL sweep (+ its logs) → killed-thesis prune → persist → dashboard
+        (Arch §5 step 5; main.py:770-780). A save failure is swallowed (V1's
+        `save_memory` printed and continued)."""
         assert self._store is not None
-        self._store.apply(self._store.ttl_sweep(self._clock))
+        ttl_decision = self._store.ttl_sweep(self._clock)
+        self._store.apply(ttl_decision)
+        for event in ttl_decision.log_events:
+            self._writer(render_log_event(event))
+
         self._store.prune_killed_theses(self._clock)
+
         try:
             self._persistence.save_active_signals(self._store.active)
             self._persistence.save_killed_theses(self._store.killed_theses)
         except PersistenceError:
-            return
+            pass
+
+        for line in render_dashboard(self._store.active):
+            self._writer(line)
