@@ -152,14 +152,35 @@ class TestRiskMatchesV1(unittest.TestCase):
             cls.cases.append((name, d1, h1, strategy.build_signal_context(d1, h1)))
 
     def test_matches_v1_h1_setup_field_for_field(self):
+        # sl/tp match V1 exactly on every path. tp_source/tp_rr match V1 except
+        # on a READY CONTINUATION, where V1's values are an accident (BUG-1: a
+        # missing `nonlocal` forced None/None) and V2 now publishes the real
+        # provenance — the one deliberate, documented divergence (metadata only;
+        # REPLAY_CONTRACT.md C-1.3). There V2 must publish non-None values.
         compared = 0
         for name, d1, h1, v1 in self.cases:
             h1_setup = v1.get("h1_setup")
             if not h1_setup:
                 continue
             compared += 1
+            plan = v2_risk(d1, h1)
+            ready_continuation_path = (
+                h1_setup.get("entry_mode") == "CONTINUATION"
+                and bool(h1_setup.get("entry_ready"))
+            )
             with self.subTest(frame=name):
-                self.assertEqual(risk_of(v2_risk(d1, h1)), v1_risk_of(h1_setup))
+                self.assertEqual(
+                    (plan.sl, plan.tp), (h1_setup["sl"], h1_setup["tp"])
+                )
+                if ready_continuation_path:
+                    self.assertIsNone(h1_setup["tp_source"])  # V1's accident
+                    self.assertIsNotNone(plan.tp_source)      # V2's fix
+                    self.assertIsNotNone(plan.tp_rr)
+                else:
+                    self.assertEqual(
+                        (plan.tp_source, plan.tp_rr),
+                        (h1_setup["tp_source"], h1_setup["tp_rr"]),
+                    )
         self.assertGreater(compared, 20)
 
     def test_corpus_covers_ready_and_not_ready_levels(self):
@@ -447,26 +468,29 @@ class TestTwoRFallback(unittest.TestCase):
         self.assertNotIn(plan.tp_source, {"fallback_2r", None})
         self.assertTrue(plan.tp > 0)
 
-    def test_continuation_never_publishes_tp_source(self):
-        # V1 quirk: continuation's tp_source/tp_rr never escape the nested
-        # function, so a real target still publishes source=None, rr=None.
+    def test_continuation_publishes_tp_source(self):
+        # BUG-1 fix (re-based deliberately; REPLAY_CONTRACT.md C-1.3): V1
+        # dropped continuation tp_source/tp_rr via a missing `nonlocal` — a
+        # scoping accident. Post-migration the real provenance is published.
+        # sl/tp themselves are still asserted V1-identical elsewhere.
         df = build_frame(n=120)
         highs = tuple(swing(i, 130.0, "high") for i in (40, 60, 80))
         targeted = plan_risk(
             ready_continuation(entry_price=100.0), "LONG", df, 1.0, highs, (), None,
         )
         self.assertTrue(targeted.tp > 0)
-        self.assertIsNone(targeted.tp_source)
-        self.assertIsNone(targeted.tp_rr)
+        self.assertIsNotNone(targeted.tp_source)
+        self.assertNotEqual(targeted.tp_source, "fallback_2r")
+        self.assertIsNotNone(targeted.tp_rr)
 
-        # ...and the same holds when it falls back to 2R.
+        # ...and the 2R fallback is attributed too.
         fell_back = plan_risk(
             ready_continuation(entry_price=100.0), "LONG", df, 1.0, (), (),
             (block(top=100.0, bottom=97.0),),
         )
         self.assertTrue(fell_back.tp > 0)
-        self.assertIsNone(fell_back.tp_source)
-        self.assertIsNone(fell_back.tp_rr)
+        self.assertEqual(fell_back.tp_source, "fallback_2r")
+        self.assertEqual(fell_back.tp_rr, 2.0)
 
 
 # --------------------------------------------------------------------------

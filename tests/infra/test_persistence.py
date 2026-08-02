@@ -13,8 +13,25 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from v2.domain import ActiveSignal, KilledThesisRecord, OBAuditRecord
+from v2.domain import (
+    ActiveSignal,
+    KilledThesisRecord,
+    LEDGER_SCHEMA_VERSION,
+    OBAuditRecord,
+    SignalLedgerRecord,
+)
 from v2.infra.persistence import PersistenceAdapter, PersistenceError
+
+
+def make_ledger(**overrides) -> SignalLedgerRecord:
+    base = dict(
+        schema_version=LEDGER_SCHEMA_VERSION, strategy_version="2.0.0",
+        recorded_at=1_700_000_000.0, symbol="BTC/USDT", h1_last_ts=5000.0,
+        decision="VALID", score=12, entry_mode="RETRACEMENT",
+        regime="expansion_up", session_active=True, live_price=100.0,
+    )
+    base.update(overrides)
+    return SignalLedgerRecord(**base)
 
 
 def make_active_signal(**overrides) -> ActiveSignal:
@@ -53,6 +70,7 @@ class PersistenceTestCase(unittest.TestCase):
         self.active_pois = self.base / "active_pois.json"
         self.killed_thesis = self.base / "killed_thesis.json"
         self.ob_audit = self.base / "retracement_ob_audit.jsonl"
+        self.signal_ledger = self.base / "signal_ledger.jsonl"
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -207,6 +225,35 @@ class TestOBAuditAppend(PersistenceTestCase):
         self.adapter.append_ob_audit(record)
         line = self.ob_audit.read_text(encoding="utf-8").splitlines()[0]
         self.assertEqual(OBAuditRecord.from_v1_dict(json.loads(line)), record)
+
+
+class TestSignalLedgerAppend(PersistenceTestCase):
+    def test_append_creates_file_and_writes_one_line(self):
+        record = make_ledger()
+        self.adapter.append_signal_ledger(record)
+        lines = self.signal_ledger.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0]), record.to_jsonl_dict())
+
+    def test_append_multiple_preserves_order(self):
+        self.adapter.append_signal_ledger(make_ledger(symbol="A/USDT", decision="SKIP"))
+        self.adapter.append_signal_ledger(make_ledger(symbol="B/USDT", decision="A+"))
+        lines = self.signal_ledger.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(json.loads(lines[0])["symbol"], "A/USDT")
+        self.assertEqual(json.loads(lines[1])["decision"], "A+")
+
+    def test_appended_line_round_trips_to_record(self):
+        record = make_ledger(direction="LONG", notes=("weekly_aligned", "sweep"))
+        self.adapter.append_signal_ledger(record)
+        line = self.signal_ledger.read_text(encoding="utf-8").splitlines()[0]
+        self.assertEqual(SignalLedgerRecord.from_jsonl_dict(json.loads(line)), record)
+
+    def test_os_error_is_translated(self):
+        # A directory where the file is expected -> open("a") raises OSError.
+        self.signal_ledger.mkdir()
+        with self.assertRaises(PersistenceError):
+            self.adapter.append_signal_ledger(make_ledger())
 
 
 class TestExceptionTranslation(PersistenceTestCase):

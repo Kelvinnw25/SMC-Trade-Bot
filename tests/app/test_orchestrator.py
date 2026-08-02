@@ -80,7 +80,7 @@ def prior_short_alerted() -> ActiveSignal:
 
 def make_orch(*, market, analyzer, clock=None, persistence=None, notifier=None,
               reconciler=None, config=None, top_coins_limit=30, writer=None,
-              sleeper=None):
+              sleeper=None, source="live", run_id=None, data_snapshot_id=None):
     return Orchestrator(
         clock=clock or sniper_clock(),
         market_data=market,
@@ -92,6 +92,9 @@ def make_orch(*, market, analyzer, clock=None, persistence=None, notifier=None,
         reconciler=reconciler,
         writer=writer or (lambda line: None),
         sleeper=sleeper or (lambda s: None),
+        source=source,
+        run_id=run_id,
+        data_snapshot_id=data_snapshot_id,
     )
 
 

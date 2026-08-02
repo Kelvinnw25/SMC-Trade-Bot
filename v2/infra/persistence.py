@@ -39,23 +39,85 @@ import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Protocol, runtime_checkable
 
-from v2.domain import ActiveSignal, KilledThesisRecord, OBAuditRecord
+from v2.domain import (
+    ActiveSignal,
+    KilledThesisRecord,
+    OBAuditRecord,
+    SignalLedgerRecord,
+)
 
-__all__ = ["PersistenceAdapter", "PersistenceError"]
+__all__ = ["PersistenceAdapter", "PersistenceError", "PersistencePort"]
 
 # V1 filenames (config.ACTIVE_POIS_FILE / main.STATE_FILE, KILLED_THESIS_FILE,
 # OB_AUDIT_FILE). Preserved exactly so existing V1 files load without migration.
 _ACTIVE_POIS_FILE = "active_pois.json"
 _KILLED_THESIS_FILE = "killed_thesis.json"
 _OB_AUDIT_FILE = "retracement_ob_audit.jsonl"
+# V2 evaluation dataset (Phase 7.1) — new, append-only; not a V1 file.
+_SIGNAL_LEDGER_FILE = "signal_ledger.jsonl"
 
 
 class PersistenceError(Exception):
     """A durable-storage operation failed or the file was structurally
     malformed. Raised in place of leaking an OSError / JSONDecodeError so
     consumers depend on a stable adapter-level failure type."""
+
+
+@runtime_checkable
+class PersistencePort(Protocol):
+    """The durable-storage contract the scan loop depends on.
+
+    Declared here, beside its production implementation, exactly as `Clock` and
+    `Notifier` are — so a consumer depends on this Protocol and never on
+    `PersistenceAdapter`. Six methods, because the orchestrator calls six: two
+    loads at startup, two saves at end of cycle, and two append-only observability
+    sinks. Nothing else belongs (there is deliberately no reader for either sink —
+    Decision #010: observability records are never read back at runtime).
+
+    Implementations must honour these invariants:
+
+    - **Loads never fail soft into garbage.** Absent storage yields an empty dict;
+      an individually malformed record is skipped; a structurally malformed store
+      raises `PersistenceError`. The caller's policy for that error is its own
+      (it starts empty).
+    - `default_timestamp` is threaded into record reconstruction for the rare
+      record lacking a timestamp, so this layer needs no clock of its own.
+    - **Saves are atomic** from the caller's point of view: a save either replaces
+      the stored state or leaves the previous state intact — never a partial write.
+    - **Appends are append-only.** A written line is never rewritten or reordered.
+    - Every method raises `PersistenceError` (or a subclass) and nothing else on
+      failure; the caller catches exactly that type and continues best-effort.
+
+    Implementations: `PersistenceAdapter` (live, below) is the only one today.
+    """
+
+    def load_active_signals(
+        self, *, default_timestamp: Optional[float] = None
+    ) -> dict[str, ActiveSignal]:
+        """The persisted signal memory as `{symbol: ActiveSignal}`; `{}` if absent."""
+        ...
+
+    def load_killed_theses(self) -> dict[str, KilledThesisRecord]:
+        """The killed-thesis cooldown store; `{}` if absent."""
+        ...
+
+    def save_active_signals(self, signals: Mapping[str, ActiveSignal]) -> None:
+        """Replace the stored signal memory atomically."""
+        ...
+
+    def save_killed_theses(self, theses: Mapping[str, KilledThesisRecord]) -> None:
+        """Replace the stored killed-thesis store atomically."""
+        ...
+
+    def append_ob_audit(self, record: OBAuditRecord) -> None:
+        """Append one OB-audit line (write-only observability)."""
+        ...
+
+    def append_signal_ledger(self, record: SignalLedgerRecord) -> None:
+        """Append one Signal Ledger line (write-only observability)."""
+        ...
 
 
 class PersistenceAdapter:
@@ -71,6 +133,7 @@ class PersistenceAdapter:
         self._active_pois_path = base / _ACTIVE_POIS_FILE
         self._killed_thesis_path = base / _KILLED_THESIS_FILE
         self._ob_audit_path = base / _OB_AUDIT_FILE
+        self._signal_ledger_path = base / _SIGNAL_LEDGER_FILE
 
     # -- active signals -----------------------------------------------------
 
@@ -146,6 +209,22 @@ class PersistenceAdapter:
         except OSError as exc:
             raise PersistenceError(
                 f"failed appending to {self._ob_audit_path.name}: {exc}"
+            ) from exc
+
+    # -- signal ledger (Phase 7.1 evaluation dataset) -----------------------
+
+    def append_signal_ledger(self, record: SignalLedgerRecord) -> None:
+        """Append one Signal Ledger record as a JSON line (creates the file if
+        missing). Append-only observability: one line per completed analysis,
+        every decision tier. Never read back by the runtime — evaluation tooling
+        reads it offline via ``SignalLedgerRecord.from_jsonl_dict``."""
+        line = json.dumps(record.to_jsonl_dict(), ensure_ascii=False)
+        try:
+            with open(self._signal_ledger_path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError as exc:
+            raise PersistenceError(
+                f"failed appending to {self._signal_ledger_path.name}: {exc}"
             ) from exc
 
     # -- file mechanics -----------------------------------------------------

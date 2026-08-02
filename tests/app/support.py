@@ -176,6 +176,7 @@ class FakePersistence:
         self.saved_active: Optional[Dict[str, Any]] = None
         self.saved_killed: Optional[Dict[str, Any]] = None
         self.ob_audits: List[Any] = []
+        self.ledger_records: List[Any] = []
         self.load_calls = 0
         self.save_calls = 0
         self.default_timestamps: List[Any] = []
@@ -207,6 +208,11 @@ class FakePersistence:
         if self.append_error is not None:
             raise self.append_error
         self.ob_audits.append(record)
+
+    def append_signal_ledger(self, record) -> None:
+        if self.append_error is not None:
+            raise self.append_error
+        self.ledger_records.append(record)
 
 
 # -- writer sink ------------------------------------------------------------

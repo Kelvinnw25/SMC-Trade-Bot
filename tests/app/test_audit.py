@@ -96,24 +96,30 @@ class TestPayload(unittest.TestCase):
         # LONG entry 100.0 == selected.top 100.0 -> True
         self.assertTrue(self.rec.entry_equals_ob_bottom)
 
-    def test_v1_quirk_fields_are_none_or_empty(self):
+    def test_bug2_metadata_populated(self):
+        # BUG-2 fix (re-based deliberately; REPLAY_CONTRACT.md §12): V1 left
+        # these ALWAYS empty via a key-name mismatch. The values existed on the
+        # same call and are now recorded. Write-only observability — no
+        # decision reads the record (Decision #010).
         r = self.rec
-        self.assertEqual(r.location, "")           # result.get("location","") quirk
-        self.assertIsNone(r.window_bounds)
-        self.assertIsNone(r.selected_ob_index)
-        self.assertIsNone(r.selected_ob_rank)
-        self.assertIsNone(r.selected_ob_top)
-        self.assertIsNone(r.selected_ob_bottom)
-        self.assertIsNone(r.selected_ob_size)
-        self.assertIsNone(r.current_price)
+        self.assertEqual(r.location, "discount")          # candidate.htf.location
+        self.assertEqual(r.window_bounds, (49, 58))       # candidate_window(59)
+        self.assertEqual(r.selected_ob_index, 5)
+        self.assertEqual(r.selected_ob_rank, 5)
+        self.assertEqual(r.selected_ob_top, 100.0)
+        self.assertEqual(r.selected_ob_bottom, 98.0)
+        self.assertEqual(r.selected_ob_size, 2.0)
+        self.assertEqual(r.current_price, 100.0)          # last CLOSED H1 close
+        # ...and stays distinct from the live forming-candle price.
+        self.assertEqual(r.market_price, 101.0)
 
     def test_serializes_to_v1_dict(self):
         d = self.rec.to_v1_dict()
         self.assertEqual(d["ob_meta"], {"top": 100.0, "bottom": 98.0})
-        self.assertIsNone(d["window_bounds"])
+        self.assertEqual(d["window_bounds"], {"start_index": 49, "end_index": 58})
         self.assertEqual(len(d["ob_candidates"]), 2)
-        self.assertEqual(d["location"], "")
-        self.assertEqual(d["current_price"], None)
+        self.assertEqual(d["location"], "discount")
+        self.assertEqual(d["current_price"], 100.0)
 
     def test_short_uses_bottom_for_entry_equality(self):
         ob = _ob(105.0, 100.0, index=5, selected=True)

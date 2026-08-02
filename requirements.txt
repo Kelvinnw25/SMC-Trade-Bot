@@ -1,0 +1,61 @@
+# Pinned execution environment — SMC Signal Radar
+#
+# WHY THIS FILE EXISTS
+#
+# REPLAY_CONTRACT.md C-19 conditions the project's float-determinism guarantee on
+# version identity: "Same operation order and same numpy/pandas/pandas_ta versions
+# => identical IEEE-754 results." C-16.2 *records* the environment in every run
+# manifest, but recording is not enforcing — before this file, a `pip install` could
+# silently invalidate a frozen baseline and nothing would detect it.
+#
+# C-8.5 additionally mandates that `identify_swings` keep computing `atr_mean` with
+# `df["atr"].dropna().mean()` — pandas' summation order — rather than a numpy
+# equivalent. pandas dispatches that reduction to `bottleneck` when it is installed
+# (`pd.options.compute.use_bottleneck` is True by default), and bottleneck sums
+# sequentially where numpy sums pairwise. Measured on this environment: the two
+# orders disagree in ~90% of realistic 499-element ATR arrays. `bottleneck` is
+# therefore deliberately ABSENT from this file, and tests/test_environment.py
+# asserts it stays absent.
+#
+# CHANGING THIS FILE IS A RE-BASELINING EVENT. Prior baselines become incomparable
+# (C-5.7.2) and must be re-run, not diffed.
+#
+# Interpreter (asserted by tests/test_environment.py, not installable via pip):
+# python==3.13.5
+#
+# Captured from `venv/Scripts/python.exe -m pip freeze` on 2026-08-02.
+
+aiodns==4.0.0
+aiohappyeyeballs==2.6.1
+aiohttp==3.13.5
+aiosignal==1.4.0
+attrs==26.1.0
+ccxt==4.5.54
+certifi==2026.4.22
+cffi==2.0.0
+charset-normalizer==3.4.7
+coincurve==21.0.0
+colorama==0.4.6
+cryptography==48.0.0
+frozenlist==1.8.0
+idna==3.15
+llvmlite==0.44.0
+multidict==6.7.1
+mysql-connector-python==9.7.0
+numba==0.61.2
+numpy==2.2.6
+pandas==3.0.3
+pandas-ta==0.4.71b0
+propcache==0.5.2
+pycares==5.0.1
+pycparser==3.0
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+requests==2.34.2
+setuptools==82.0.1
+six==1.17.0
+tqdm==4.67.3
+typing_extensions==4.15.0
+tzdata==2026.2
+urllib3==2.7.0
+yarl==1.23.0

@@ -1,362 +1,299 @@
-# PROJECT_STATE.md — SMC Signal Radar V2 Migration
+# PROJECT_STATE.md — SMC Signal Radar
 
-> **Single source of truth for the migration.** Read this before touching code.
-> It is maintained at every milestone. If it conflicts with memory or chat
-> history, **this file and the repository win.**
+> **Single source of truth for the project.** Read this before touching code.
 >
-> - **Checkpoint:** Phase 5.2 (Delivery & Observability) complete — **migration
->   functionally complete**; now in **Phase 6 (Shadow Validation & Cutover Prep)**.
-> - **Last updated:** 2026-07-25
-> - **Doc version:** 2.0
-> - **Environment:** Python 3.13, pandas 3.0.3, all deps in `venv/`. Windows.
-> - **Run tests:** `venv/Scripts/python.exe -m unittest discover tests` (from repo root)
+> - **Status:** Migration complete. V2 is the **only** implementation and the
+>   authoritative system. **Phase 8 architecture is closed** (Milestone M0);
+>   implementation starts at M1.
+> - **Last updated:** 2026-08-02
+> - **Doc version:** 3.8
+> - **Performance roadmap:** `IMPLEMENTATION_PLAN.md`. **All six acquisition
+>   merges are landed** — 0 (environment pinning), 1 (pooled HTTP), 2
+>   (`Retry-After` / 418 / 429), 2b (`StorageTransient`), 3a (deterministic
+>   `DownloadReport`), 3b (parallel downloader) — **plus the S11 interrupt bug
+>   fix**. Next is **Gate A: Stage 2 acquisition** — `1d` from 2022-01-01 and
+>   `5m` from 2022-12-01, with the TA.3 warmup pre-flight. Steps 4
+>   (`CachingAnalyzer`) and 5 (vectorized `identify_swings`) may be developed in
+>   parallel with Gate A.
+> - **Gate A is two commands, not one.** `CorpusSpec` carries a single `start`
+>   for all timeframes, so the plan's per-timeframe lead-ins cannot be expressed
+>   in one invocation. Pass A (`--timeframes 1d --start 2022-01-01`) then Pass B
+>   (`--timeframes 1h 1d 5m --start 2022-12-01`). **Pass B is mandatory**:
+>   `CanonicalBuilder` replaces `manifest.json` with only the timeframes of that
+>   call, so after Pass A the corpus is 1d-only and not replay-usable. Pass B
+>   rebuilds from every committed raw record and restores all three. The final
+>   manifest's `spec.start` therefore *under-declares* the corpus — verify TA.4
+>   against each dataset's `first_open_ms`, not against the manifest.
+> - **Runtime flag:** `corpus build --workers N` (default **1** = the sequential
+>   path exactly; max 6). Ordering, artifacts and corpus identity are provably
+>   independent of this value. Acquisition tunables:
+>   `BAN_PAUSE_LIMIT_SECONDS = 300` in `backtest/acquire/downloader.py` — a
+>   stated 418 ban longer than this stops the run instead of sleeping on it.
+> - **Interrupting an acquisition:** Ctrl+C cancels all queued work and aborts
+>   within the longest **in-flight** item — worst case 300 s (a ban pause), 60 s
+>   (a transport timeout), typically sub-second. Work already running finishes
+>   and commits normally; that is deliberate, because cutting a commit short is
+>   the only way to leave a partial artifact. Re-run the identical command to
+>   resume. Note that **absent periods are never committed and are therefore
+>   re-requested on every restart** — a floor of ~20 min of repeated work at
+>   Gate A scale, regardless of how late the run stopped.
+> - **Environment:** **pinned in `requirements.txt`** (Python 3.13.5, 34 `==`
+>   distributions), asserted by `tests/test_environment.py`. Windows, deps in
+>   `venv/`. Changing a pin is a re-baselining event (C-19, C-5.7.2), not an
+>   upgrade. `bottleneck` and `numexpr` must never be installed — they change
+>   pandas' reduction dispatch and would violate C-8.5.
+> - **Run tests:** `venv/Scripts/python.exe -m unittest discover -s tests -t .`
+>   (repo root). `-t .` is required: without it `discover` puts `tests/` on
+>   `sys.path`, and `tests/backtest/` then shadows the top-level `backtest`
+>   package, so those modules fail to import and their tests never run.
 
 ---
 
-## 1. Project Overview
+## 1. What this is
 
-**Project purpose.** "SMC Signal Radar" is a Python **advisory** trading-signal
-generator for Binance USDT-M perpetual futures. It scans the top-volume pairs,
-runs top-down Smart Money Concepts (SMC) analysis (D1/H1 context + optional M5
-enrichment), emits structural trade hypotheses (direction, entry, SL, TP, score,
-decision tier), tracks them in a lightweight memory with a lifecycle (kill
-switch, decay, TTL, slot cap), and pushes Telegram alerts. It **does not place
-orders** — every alert is a structural hypothesis; the operator decides
-execution (see Decision #001, "Contract B").
+**SMC Signal Radar** is a Python **advisory** trading-signal generator for
+Binance USDT-M perpetual futures. It scans the top-volume pairs, runs top-down
+Smart Money Concepts (SMC) analysis (D1/H1 context + optional M5 enrichment),
+emits structural trade hypotheses (direction, entry, SL, TP, score, decision
+tier), tracks them in a lightweight lifecycle memory (kill switch, decay, TTL,
+slot cap, killed-thesis cooldown), and pushes Telegram alerts. It **does not
+place orders** — every alert is a structural hypothesis; the operator decides
+execution ("Contract B": `entry_price` is a *structural reference*, not an
+executable order price).
 
-**Migration purpose.** Re-architect the working-but-monolithic **V1**
-(`main.py` + `src/`) into a **layered, testable V2** (`v2/`) **without changing
-any observable behavior.** V1 keeps running untouched; V2 is built underneath it
-and only replaces V1 once proven behaviorally identical. **All five layers now
-exist** — the migration is *code complete*; what remains is shadow validation
-against V1 and the operational cutover (Phase 6).
+**Project posture (new as of 2026-07-26).** The V1→V2 architectural migration is
+**complete**. V2 is now the authoritative implementation. **Behavioral
+equivalence with V1 is no longer a goal.** The objective is now to build the best
+possible SMC system: improve signal quality, entries, exits, risk, and
+validation. Changes to strategy behavior are now **allowed and expected** —
+governed by evidence (backtests / forward tests), not by matching V1.
 
-**Current architecture (V2 — all layers built).** Strict acyclic layers:
+---
+
+## 2. Current Architecture
+
+Five strict, acyclic layers (`domain ← infra ← analysis ← lifecycle ← app`):
 
 ```
-domain  (pure, immutable, zero deps)                         ✅ built · frozen
-  ▲
-infra   (I/O adapters that WRAP V1 code — the only layer allowed to import src/)  ✅ built · frozen
-  ▲
-analysis   (pure business logic — MarketSnapshot → Signal)   ✅ built · frozen
-  ▲
-lifecycle  (stateful reconciler + rules + store; injected clock)  ✅ built · frozen
-  ▲
-app        (thin orchestrator + delivery/observability)      ✅ built
-            (v2/app/orchestrator.py · rendering.py · audit.py)
+domain      v2/domain/     Immutable, dependency-free vocabulary (18 frozen dataclasses).
+infra       v2/infra/      I/O adapters: clock, market_data, persistence, notifier.
+                           Native — imports nothing from src/ (standalone since Phase 7.1).
+analysis    v2/analysis/   Pure business logic: MarketSnapshot → Signal (14 modules).
+lifecycle   v2/lifecycle/  Stateful reconciler + rules + store, on an injected clock.
+app         v2/app/        Thin orchestrator + delivery/observability (no signal logic).
 
-regression harness (tests/regression/) — verification only, outside runtime
+tests/                     784 tests (stdlib unittest, hermetic).
 ```
 
-**Overall philosophy.**
-- Behavioral equivalence with V1 is the supreme rule — provable, not hopeful.
-- Build the **pure deterministic core first**, wrap it in state and I/O last
-  (the inverse of how V1 grew).
-- Prove equivalence **at every step** (regression harness + per-layer V1
-  reference oracles).
-- One small milestone at a time; freeze each when done.
-- The six frozen docs in `SMC-BOT-DOCS/` are the governing specification.
+**Layer responsibilities**
+
+| Layer | Owns | Must not own |
+|---|---|---|
+| `domain` | Typed immutable objects, equality, V1-schema serialization | Any logic, I/O, time |
+| `infra` | Native exchange fetch, JSON/JSONL persistence (incl. the signal-ledger sink), Telegram send, clock | Strategy/scoring/lifecycle decisions |
+| `analysis` | HTF/regime/structure/OB/FVG/liquidity/entry/risk/scoring; M5 gate; choppy penalty | Memory, persistence, notify, clock |
+| `lifecycle` | Kill, stale, cooldown, same-thesis, insert/replace/cap, alert-upgrade, miss/decay, TTL, slot cap, killed store | Analysis, I/O, wall-clock |
+| `app` | Scan loop, wiring, session_active, error isolation, delivery routing/rendering | Any branch that changes a signal's outcome (Principle 12) |
+
+**Enforced invariants** (verified by tests + inspection): domain imports nothing;
+**the V2 runtime imports nothing from `src/`** (standalone since Phase 7.1 — `src/`
+is imported only by characterization tests); acyclic imports, no cycles; no
+wall-clock reads in domain/analysis/lifecycle (injected `Clock`); the orchestrator
+holds no signal-deciding branch. Observability records (`OBAuditRecord`,
+`SignalLedgerRecord`) are write-only — never read back into a runtime decision.
 
 ---
 
-## 2. Current Version
-
-| Field | Value |
-|---|---|
-| **Current milestone** | Phase 5.2 Delivery & Observability — **COMPLETE**. Migration is **code complete**. |
-| **Current phase** | **Phase 6 — Shadow Validation, Cutover Preparation & Final Review** (no new development; validation + docs only) |
-| **Architecture state** | Domain ✅ · Infrastructure ✅ · Analysis ✅ · Lifecycle ✅ · App (orchestrator + delivery) ✅ · Regression harness ✅ |
-| **Test status** | **763 tests** (domain 39 · infra 83 · analysis 478 · lifecycle 58 · app 60 · regression 45). **762 pass; 1 known calendar-dependent flake** — see note below. |
-| **V1 status** | Untouched and runnable (`python main.py`) |
-| **Git status** | ✅ **Git repository.** Branch `main`, 12 commits, tag `v0.1.0`. One commit per phase. |
-| **Git tag** | `v0.1.0` present. Recommended before cutover: tag this checkpoint `v2-code-complete` and the post-shadow cutover `v2-cutover`. |
-
-> **Known non-blocking flake:** `tests/analysis/test_scoring.py::test_corpus_covers_every_decision_tier`
-> asserts the inline corpus reaches an `A+` tier, but its `SESSION_ACTIVE`
-> reads the **wall clock** (`SMCStrategy().get_session_mode()`). On weekends /
-> outside 07:00–22:00 UTC the +1 session bonus is absent, so the corpus tops out
-> at `VALID` and the assertion fails. This is a **test-construction** issue in a
-> frozen Phase-3 analysis test (it depends on when the suite runs, not on any V2
-> code). It is **documented, not fixed**, because touching it would reopen a
-> frozen module outside an approved milestone. Fixing it (injecting a fixed
-> session flag into the corpus builder) is a candidate Phase-6 housekeeping item.
-
----
-
-## 3. Completed Milestones
-
-| # | Milestone | What was delivered | Key architectural decisions |
-|---|---|---|---|
-| 0 | **Documentation baseline** | 6 frozen governing docs in `SMC-BOT-DOCS/` synchronized; Decision **#010** added; proposed patches **P1–P5 applied** (with approval). | Frozen-docs workflow: never edit `SMC-BOT-DOCS/` without an explicit approved patch. |
-| 1 | **Domain Model Foundation** (`v2/domain/`) | 18 immutable frozen dataclasses (the full typed vocabulary). 39 tests. | Immutable `@dataclass(frozen=True)`; `str` enums to preserve V1 serialization; `MarketSnapshot` DataFrames immutable **by contract**; `Signal.candidate` is single source of truth; exact 17-field `ActiveSignal` schema + V1 load-lossiness reproduced. |
-| 2.1 | **Clock adapter** (`v2/infra/clock.py`) | `Clock` Protocol, `SystemClock`, `FakeClock`. 21 tests. | Injectable time (no wall-clock reads leak); enables deterministic lifecycle. |
-| 2.2 | **Market Data adapter** (`v2/infra/market_data.py`) | Wraps V1 `BinanceHandler`; produces `MarketSnapshot`. 24 tests. | Sole V2 entry to exchange data; mirrors V1 fetch limits, `iloc[:-1]` strip, live-price separation, M5 guards. |
-| 2.3 | **Persistence adapter** (`v2/infra/persistence.py`) | Wraps V1 JSON persistence; reuses domain serialization; `append_ob_audit` JSONL sink. 24 tests. | Zero schema drift (V1↔V2 read each other); missing→empty; **error-surfacing divergence**: malformed/OS errors raise `PersistenceError` where V1 swallowed. |
-| 2.4 | **Notifier adapter** (`v2/infra/notifier.py`) | `Notifier` Protocol + `TelegramNotifier` wrapping V1 senders. 14 tests. | Backend-agnostic seam; routes `Alert` by `.kind`; text-only; `NotifierError` on failure (error-surfacing divergence). |
-| — | **Golden Oracle / Regression Harness** (`tests/regression/`) | `InputSnapshot`, `ObservableBehavior`, `Analyzer` + `V1Oracle`, comparison engine, reports, runner, generator CLI, committed fixture + golden. 45 tests. | Verification-only, outside runtime; runs V1's **unmodified** functions and reads intermediates from `context["debug"]` (no V1 instrumentation). |
-| 3 | **Pure Analysis Layer** (`v2/analysis/`) | 14 pure modules (`htf`, `regime`, `structure`, `order_block`, `fair_value_gap`, `liquidity`, `entry`, `risk`, `scoring`, `frames`, `stage`, `context`, `pipeline`, `engine`) producing an immutable `Signal` from a `MarketSnapshot`. 478 tests. | Pure & stateless (no memory/persistence/notify/clock); staged pipeline; `V2Analyzer.analyze()` owns the M5 `score≥8` gate and the choppy penalty; diffed field-for-field against the real `SMCStrategy` V1 oracle. |
-| 4 | **Lifecycle Core** (`v2/lifecycle/`) | `config`, `rules` (ONE copy of each V1 predicate incl. the KILL `is_poi_invalidated`), `memory` (read-only view), `store` (single writer + pure TTL sweep), `reconciler` (verbatim transcription of V1's memory engine). 58 tests. | Lifecycle owns all state/transitions; injected clock only; `LifecycleDecision` is declarative (mutations + alerts + log_events + killed_theses); proven via a 12-seed × 60-cycle × 6-symbol replay against a V1 reference. |
-| 5.1 | **Thin Orchestrator** (`v2/app/orchestrator.py`) | Startup/wiring, scan loop, per-symbol isolation, `session_active` (clock only), fetch → analyze → reconcile → apply → dispatch → persist. 23 tests (initial). | Coordination only, no signal-deciding branch (Principle 12); runs `pipeline.run` once (context/HTF/pre-M5) + `analyze` once (final Signal); M5 gate stays in analysis. |
-| 5.2 | **Delivery & Observability** (`v2/app/rendering.py`, `audit.py`, orchestrator) | Pure dashboard/scan/LogEvent renderers; `assemble_ob_audit` from domain objects; wired routing (terminal / notifier / OB-audit JSONL) + V1 cadence (0.20s fetch, 30s empty, 60s cycle). 60 app tests total. | Presentation is pure; audit reads domain objects only (reuses `lifecycle.rules.levels_valid`, no re-analysis); RAW-score & OB-audit V1 quirks reproduced; dedup set orchestrator-owned (Decision #010). |
-
-Full rationale for each behavioral decision is in `SMC-BOT-DOCS/05-decision-log.md`
-(**Decisions #001–#010**, all binding).
-
----
-
-## 4. Current Folder Structure
+## 3. Repository Layout
 
 ```
 bot_trading_smc/
-├─ main.py                 V1 orchestrator loop (the running system). DO NOT MODIFY.
-├─ src/                    V1 modules. DO NOT MODIFY.
-│   ├─ api_handler.py        Binance fetch + ATR (BinanceHandler)
-│   ├─ strategy.py           SMCStrategy: build_signal_context / score_signal /
-│   │                        enrich_with_m5 / is_poi_invalidated  ← all analysis logic
-│   ├─ telegram_notifier.py  send_signal_alert / send_upgrade_alert / send_kill_alert
-│   ├─ config.py             env + thresholds
-│   └─ executor.py           V1 order-execution helper (not used by the radar path)
-│
-├─ SMC-BOT-DOCS/           Frozen governing specification (6 docs). Change only via approved patch.
-│   ├─ 00-project-context.md · 01-legacy-documentation.md · 02-software-architecture.md
-│   ├─ 03-implementation-roadmap.md · 04-engineering-rules.md · 05-decision-log.md (#001–#010)
-├─ BLUEPRINT.md · MODULE_INTENT.md   V1-era design notes (legacy reference).
-│
-├─ v2/                     THE MIGRATION TARGET — all layers built.
-│   ├─ domain/             Phase 1 — 18 immutable objects. Zero dependencies. FROZEN.
-│   ├─ infra/              Phase 2 — clock, market_data, persistence, notifier. FROZEN.
-│   │                      (Only layer permitted to import src/.)
-│   ├─ analysis/           Phase 3 — 14 pure modules; MarketSnapshot → Signal. FROZEN.
-│   ├─ lifecycle/          Phase 4 — config, rules, memory, store, reconciler. FROZEN.
-│   └─ app/                Phase 5 — orchestrator.py, rendering.py, audit.py.
-│                          Coordination + delivery routing only (no business logic).
-│
-├─ tests/                  Authoritative test suite (stdlib unittest) — 763 tests.
-│   ├─ domain/ (39) · infra/ (83) · analysis/ (478) · lifecycle/ (58) · app/ (60)
-│   └─ regression/ (45)   Golden Oracle / Regression Harness + README + fixtures. FROZEN.
-│
-├─ active_pois.json · killed_thesis.json · retracement_ob_audit.jsonl
-│                          V1 LIVE runtime state/artifacts. Treat as production data.
-└─ debug_api.py · final_test.py · test_api.py · test_strategy.py
-                           Legacy V1 ad-hoc scripts. NOT part of the migration suite.
+├─ v2/                     THE SYSTEM (all five layers). Authoritative. STANDALONE.
+│   ├─ domain/  infra/  analysis/  lifecycle/  app/
+│   ├─ run.py                entrypoint: `python -m v2.run` → Orchestrator.create().run_forever()
+│   ├─ infra/config.py       native runtime config (Phase 7.1; replaced src/config)
+│   ├─ domain/signal_ledger.py · app/ledger.py   Signal Ledger (Phase 7.1 evaluation dataset)
+├─ src/                    V1 — HISTORICAL. No longer imported by the V2 runtime:
+│   ├─ api_handler.py · telegram_notifier.py · config.py   internalized into v2/infra (Phase 7.1); now orphaned
+│   ├─ strategy.py           legacy analysis — reimplemented in v2/analysis; still referenced by characterization tests
+│   └─ executor.py           legacy order-exec helper — dead (no importer)
+├─ main.py                 legacy V1 loop — reimplemented by v2/app; reference only
+├─ tests/                  domain·infra·analysis·lifecycle·app·regression (784)
+├─ signal_ledger.jsonl     LIVE evaluation dataset (append-only; created on first run)
+├─ PROJECT_STATE.md · CHANGELOG.md · STRATEGY_NOTES.md · REPLAY_CONTRACT.md
+│                          living docs (see §8 for responsibilities)
+├─ SMC-BOT-DOCS/           migration-era governing spec (historical; see §7)
+├─ BLUEPRINT.md · MODULE_INTENT.md   V1-era design notes (historical)
+├─ active_pois.json · killed_thesis.json · retracement_ob_audit.jsonl   LIVE runtime state
+└─ debug_api.py · final_test.py · test_api.py · test_strategy.py   legacy scratch scripts
 ```
 
-> The **authoritative test suite is `tests/`** (run via `unittest discover
-> tests`). The root-level `test_*.py` / `debug_api.py` / `final_test.py` are V1-era
-> scratch scripts — do not treat them as the migration's tests.
+> **Standalone since Phase 7.1.** The V2 runtime imports nothing from `src/`;
+> `api_handler.py`, `telegram_notifier.py` and `config.py` were internalized into
+> `v2/infra`. `src/strategy.py`, `main.py` and `src/executor.py` are reference only —
+> but `strategy.py` is still imported by the characterization test suite, so it
+> stays on disk until those tests are re-based on captured golden output.
+>
+> `backtest/` (the replay engine, Phase 8) does not exist yet. Its layout and
+> dependency direction are fixed by `REPLAY_CONTRACT.md` §10: it imports `v2`
+> freely, and **`v2` never imports `backtest`**.
 
 ---
 
-## 5. Architecture Rules (immutable)
+## 4. Current Strategy (as implemented in `v2/analysis`)
 
-| # | Rule |
-|---|---|
-| A1 | **`v2/domain` depends on NOTHING** — no `src/`, no `v2/infra`, no I/O, no clock, no network. (Enforced by `tests/domain/test_domain_purity.py`.) |
-| A2 | **Only `v2/infra` may import `src/`.** It is the sole anti-corruption boundary that wraps V1. No other V2 layer imports `src/`. (Verified: zero `src/` imports outside infra.) |
-| A3 | **V1 is never modified.** `main.py`, `src/`, `BLUEPRINT.md`, `MODULE_INTENT.md` stay byte-for-byte as-is until cutover. |
-| A4 | **Dependency direction is acyclic:** `domain ← infra ← analysis ← lifecycle ← app`. No layer imports a layer above it; no cycles. (Verified: import graph clean, no circular imports.) |
-| A5 | **All domain objects are immutable** frozen dataclasses. The single exception is `MarketSnapshot`'s pandas DataFrames (immutable *by contract*). |
-| A6 | **Adapters & orchestrator use constructor dependency injection.** No singletons, no global state, no DI framework. The real dependency is the default; tests inject fakes (incl. `writer`/`sleeper`). |
-| A7 | **Responsibility separation:** infra = I/O only; analysis = pure business logic only; lifecycle = state only; app = coordination + presentation only (no signal-deciding logic). |
-| A8 | **The regression harness is verification-only.** It lives outside runtime (`tests/regression/`); no runtime module (`v2/`, `src/`, `main.py`) may import it. |
-| A9 | **No wall-clock reads in analysis/lifecycle/domain.** All time comes from the injected `Clock`. The orchestrator reads the clock only for `session_active`, and `time.sleep` only for cadence (both injectable). (Verified: zero `datetime.now`/`utcnow`/`time.time` in those layers.) |
-| A10 | **Principle 12 — the orchestrator holds no branch that changes a signal's outcome.** The M5 `score≥8` gate and the choppy penalty live in `analysis`, not `app`. (Verified by inspection + the "owns-no-logic" orchestrator tests.) |
+A top-down, single-pass pipeline per symbol per cycle:
 
----
+1. **HTF context** (`htf.py`) — prior-day/week levels; `weekly_bias` = price vs
+   prior-week midpoint; `d1_bias`/`h4_bias` = EMA50/EMA200 + 2-swing structure
+   (`_derive_simple_bias`); `location` = discount/premium/equilibrium;
+   `momentum_weakening`. Direction from a weighted vote (weekly 4 · d1 2 · h4 1 ·
+   location ±0.5–1.5, H1 fallback), with a rotational weekly-anchor override and a
+   hard expansion-vs-direction veto.
+2. **Regime** (`regime.py`) — 3-vote compression/expansion classifier over ATR
+   ratios, body ratio, drift → {expansion_up/down, accumulation, distribution,
+   rotational, compression, neutral, unknown} → execution mode {CONTINUATION,
+   RETRACEMENT, WATCH_ONLY, NONE}.
+3. **Structure / OB / FVG / liquidity** — swings; order blocks (raw origin candle
+   in a 10-bar window, size/not-lost/distance quality filter, first-match
+   selection); FVG (boolean three-candle imbalance); liquidity sweep
+   (pierce + reclaim + depth + body-reclaim).
+4. **Entry** (`entry.py`) — CONTINUATION: displacement (≤3 bars back) + micro-
+   pullback (0.10 ATR) + reclaim → pullback close. RETRACEMENT: fresh quality OB →
+   entry at block edge. WATCH_ONLY / NONE otherwise.
+5. **Risk** (`risk.py`) — SL: continuation pullback bar ±0.30 ATR; retracement OB
+   far edge ±0.70 ATR. TP: RR-aware liquidity target (EQH/EQL cluster → swing →
+   PDH/PDL), else fixed **2R** fallback. Hard **1.2 RR floor**.
+6. **Scoring** (`scoring.py`) — additive score: HTF alignment (weekly 2 · d1 2 ·
+   h4 1 · location 2), mode-aware confirmations (sweep/FVG/OB/displacement),
+   structure quality (target_clear/session/htf_clean), regime, RR bonus (1.5/2/3),
+   momentum, M5 CHoCH; choppy penalty −2. Tiers per mode → SKIP/WATCH/VALID/A+.
+7. **M5 enrichment** — re-scores with M5 CHoCH confirmation when the pre-M5 score
+   ≥ 8.
 
-## 6. Migration Principles (every future change must obey)
+**Lifecycle** (`v2/lifecycle`) — kill (HTF D1+H4 flip **or** SL break ±0.30 ATR),
+pre-memory stale, kill-cooldown (1h), same-thesis partial refresh, insert /
+replace-weakest-by-score / slot cap (10), alert new/upgrade dedup by tier,
+H1-gated miss increment → decay eviction at 3 misses, TTL (24h untapped / 6h
+tapped / 10h manual).
 
-1. **Behavioral equivalence is supreme.** V2 must produce identical observable
-   output to V1. When the Architecture spec and V1's *actual behavior* disagree,
-   **V1 wins** (doc-priority: Engineering Rules > V1 actual behavior >
-   Architecture > Roadmap > Decision Log).
-2. **No redesign, no optimization.** Never "improve" strategy, scoring,
-   thresholds, or lifecycle. A cleaner V2 that behaves differently has **failed**.
-3. **Regression-first / equivalence-proven.** Every behavior-bearing layer is
-   diffed against V1's unmodified functions before the layer above consumes it.
-4. **Incremental, small milestones.** One phase at a time. **STOP** at each
-   boundary and wait for explicit approval before the next.
-5. **Freeze completed modules.** Once a milestone passes, its code is frozen;
-   reopening it requires a new, explicitly-approved milestone.
-6. **Surface, don't silently fix, questionable legacy behavior.** Preserve V1
-   quirks; document concerns separately (Decision #010).
-7. **No new dependencies** without explicit approval. Tests use **stdlib
-   `unittest`** only. **pytest is not installed and must not be introduced.**
-8. **Frozen docs.** Never edit `SMC-BOT-DOCS/` directly; deliver a proposed patch
-   and wait for approval.
-9. **Deliberate divergences are documented.** The sanctioned behavior changes:
-   *error surfacing* (adapters raise typed exceptions where V1 swallowed — the
-   orchestrator re-applies V1's swallow-and-continue at the edge) and the
-   *behavior-neutral M5 fetch cadence* (V2 always fetches M5; `analyze` decides
-   whether to use it). Message/format/values are unchanged.
-
----
-
-## 7. Verification Model (how equivalence is proven)
-
-**Two complementary mechanisms, both hermetic (no network / Telegram / real FS /
-wall clock):**
-
-1. **Regression harness** (`tests/regression/`) — feeds one `MarketSnapshot`
-   identically to `V1Oracle` (V1's unmodified `build_signal_context` /
-   `enrich_with_m5` / `is_poi_invalidated`, reading its own `context["debug"]`)
-   and to `V2Analyzer`, then diffs two `ObservableBehavior` records field-by-field
-   with **exact equality by default**. `compare_analyzers(snap, V1Oracle(),
-   V2Analyzer()).ok == True` means zero divergence.
-2. **Per-layer V1 reference oracles** — analysis tests diff `V2Analyzer` against a
-   fresh `SMCStrategy` on synthetic corpora (`tests/analysis/test_scoring.py`,
-   `test_htf.py`); lifecycle tests replay a byte-transcribed V1 reference
-   (`tests/lifecycle/v1_reference.py`) over 12 seeds × 60 cycles × 6 symbols,
-   asserting identical active memory, killed store, alerts, and event sequence;
-   app tests assert byte-exact rendered strings and routing via injected fakes.
-
-**Standing gap (Phase 6):** the harness has only run against the **committed
-synthetic fixture** (a plumbing check) and inline corpora — **no real,
-multi-symbol, multi-cycle golden dataset has been captured**. Meaningful
-end-to-end shadow equivalence still requires that capture (see §11).
-
-**Commands:**
-```bash
-venv/Scripts/python.exe -m unittest discover tests        # 763 tests (1 known flake)
-
-# Rebuild the deterministic fixture (no network):
-venv/Scripts/python.exe -m tests.regression.generate synthetic \
-    --out tests/regression/fixtures/synthetic_short.json
-
-# Capture a real snapshot from live V1 (network; manual):
-venv/Scripts/python.exe -m tests.regression.generate live \
-    --symbol BTC/USDT --out tests/regression/fixtures/btcusdt.json --m5 --golden
-```
+> The full itemized strategy audit (weak assumptions, duplicated confirmations,
+> score inflation, entry/exit/kill/lifecycle weaknesses A1–A25), the two confirmed
+> implementation bugs (BUG-1, BUG-2), the validated design decisions, and the
+> experiment log live in **`STRATEGY_NOTES.md`** — the permanent strategy
+> notebook. This file (`PROJECT_STATE.md`) does not duplicate them; it points to
+> them.
 
 ---
 
-## 8. Roadmap
+## 5. Testing Status
 
-- [x] **Milestone 0** — Documentation baseline (frozen docs, Decision #010, P1–P5)
-- [x] **Phase 1** — Domain Model Foundation (`v2/domain/`, 18 objects)
-- [x] **Phase 2** — Infrastructure Adapters (2.1 Clock · 2.2 Market Data · 2.3 Persistence · 2.4 Notifier)
-- [x] **Golden Oracle / Regression Harness** (`tests/regression/`)
-- [x] **Phase 3** — Pure Analysis Layer (`v2/analysis/`, 14 modules)
-- [x] **Phase 4** — Lifecycle Core (`v2/lifecycle/`; reconciler + rules + store; injected clock)
-- [x] **Phase 5.1** — Thin Orchestrator (`v2/app/orchestrator.py`)
-- [x] **Phase 5.2** — Delivery & Observability (`v2/app/rendering.py`, `audit.py`)
-- [ ] **Golden dataset capture** — real multi-symbol, multi-cycle V1 recordings across diverse market conditions *(still outstanding; prerequisite for meaningful shadow validation)*
-- [ ] **Phase 6** — Shadow Validation & Cutover  ⬅️ **CURRENT** (see §11)
-  - [ ] Shadow-run V2 alongside V1 to **zero divergence** across a diverse window
-  - [ ] Complete the cutover checklist → switch production to `Orchestrator.create()` → retire V1
+**784 tests**, stdlib `unittest`, hermetic (no network / Telegram / real FS /
+wall clock): domain 45 · infra 87 · analysis 478 · lifecycle 58 · app 71 ·
+regression 45. (The +21 over the prior 763 are the Phase-7.1 Signal Ledger:
+domain schema, infra sink, app assembler + orchestrator wiring.)
 
----
-
-## 9. Definition of Done (per milestone)
-
-A milestone is complete only when **all** hold:
-
-- [ ] **Scope respected** — only the approved milestone was built; no scope creep.
-- [ ] **Architecture rules hold** (§5) — verified (domain purity, no `src/` outside
-      infra, acyclic imports, no clock leak, orchestrator holds no signal branch).
-- [ ] **Equivalence proven** — for behavior-bearing phases, diffed against V1's
-      unmodified functions with **zero divergence** (harness and/or per-layer oracle).
-- [ ] **All tests pass** — `venv/Scripts/python.exe -m unittest discover tests`
-      (currently 763; the one calendar-dependent flake is documented, §2).
-- [ ] **V1 untouched** — `main.py`, `src/`, `BLUEPRINT.md`, `MODULE_INTENT.md`
-      unchanged.
-- [ ] **No new dependencies** — stdlib only unless explicitly approved.
-- [ ] **Frozen docs untouched** — or delivered as an approved patch.
-- [ ] **`PROJECT_STATE.md` + `CHANGELOG.md` updated** — reflect the new state.
-- [ ] **Project memory updated** — `…/memory/v2-migration-status.md`.
-- [ ] **Committed & tagged** — one commit per milestone (+ a tag at checkpoints).
-- [ ] **STOP** — do not begin the next milestone without explicit approval.
+- **All 784 pass when run inside session hours.** One test is
+  **calendar-dependent**: `tests/analysis/test_scoring.py::test_corpus_covers_every_decision_tier`
+  reads the wall clock (`SMCStrategy().get_session_mode()`), so run off-session it
+  cannot reach the `A+` tier and fails. Verified green 2026-07-27. Fix candidate:
+  inject a fixed session flag into the corpus builder (Phase-7 test cleanup).
+- Analysis and lifecycle tests currently assert against V1's outputs
+  (characterization / golden-master). As strategy behavior intentionally changes
+  in Phase 9+, these must be **re-based on captured expected output**, not on the
+  V1 oracle. Track this in the Phase-7 evaluation.
 
 ---
 
-## 10. Current Constraints — Frozen Subsystems
+## 6. Roadmap (post-migration)
 
-**Must NOT be modified (frozen):**
+**Current priorities (Phase 7→8 transition):**
+- ✅ **V2 runtime standalone** — `infra` decoupled from `src/` (Phase 7.1); runner
+  `v2/run.py` confirmed present.
+- ✅ **Signal Ledger** — every completed analysis (all tiers) recorded to
+  `signal_ledger.jsonl` (Phase 7.1). Write-only, append-only.
+- ✅ **BUG-1 + BUG-2 fixed** (2026-07-26, re-validated under the contract):
+  continuation `tp_source`/`tp_rr` published; OB-audit selected-OB/window/
+  location/current_price populated. Metadata-only (proven: no decision-bearing
+  test changed); `STRATEGY_VERSION` → **2.0.1**.
+- ✅ **Replay & Outcome Semantics Contract v1.1** — `REPLAY_CONTRACT.md`
+  (2026-07-27, Milestone **M0**). Replaces v1.0 entirely. Closes the four
+  architectural blockers that stood between the repository and Phase 8:
+  | Blocker | Finding | Closed by |
+  |---|---|---|
+  | B1 replay time semantics | A47 | §5 (C-5.0–C-5.8): `T` = close boundary, `h1_last_ts = T − 3600`, clock = `T + 1s`, ordering guarantees, burn-in |
+  | B2 window construction | A49 | §6 (C-6.2–C-6.4, C-6.7–C-6.11): row-slice windows, prohibition list, partial history, integrity |
+  | B3 lifecycle capture | A50 | §15: `RecordingReconciler`, event schema, TTL attribution with a completeness proof |
+  | B4 ledger lineage | A53 | §16: `schema_version` 2, nine lineage fields, zero-cost migration |
+  Also corrected a factual error in v1.0 (C-5.2 M5 fidelity, finding A48) and
+  closed the residual fill-model gaps (walk origin, pre-crossed limits, missing-M5
+  fallback, R arithmetic, shadow classes).
+- ⏳ **Phase 8 implementation** — starts at **M1** (ledger schema 2, the only
+  production change the contract authorizes; scope fixed by C-16.3.1), then
+  M2 ports · M3 repository · M4 downloader · M5 universe table · M6 adapter ·
+  M7 captures · M8 driver · M9 performance · M10 outcome engine · M11 metrics.
+  **No strategy-behavior change anywhere in Phase 8.**
 
-| Subsystem | Reason |
-|---|---|
-| `main.py`, `src/` (V1) | V1 is the behavioral reference and stays runnable until cutover. |
-| `BLUEPRINT.md`, `MODULE_INTENT.md` | V1 design reference. |
-| `SMC-BOT-DOCS/` (6 docs) | Frozen governing spec — change only via approved patch. |
-| `v2/domain/` | Phase 1 complete → frozen. |
-| `v2/infra/` | Phase 2 complete → frozen. |
-| `v2/analysis/` | Phase 3 complete → frozen. |
-| `v2/lifecycle/` | Phase 4 complete → frozen. |
-| `tests/regression/` (harness, fixtures, goldens) | The equivalence reference — must stay stable so future results are comparable. |
-| `active_pois.json`, `killed_thesis.json`, `retracement_ob_audit.jsonl` | V1 **live** runtime state — production data, not test scratch. |
+| Phase | Name | Goal |
+|---|---|---|
+| **7** | **Evaluation** ⬅ current | Fix metadata bugs; add a runner + instrumentation; capture a real signal dataset; publish the audit (`STRATEGY_NOTES.md`) + baseline metrics; decouple `infra` from `src/`. **No strategy-behavior change.** |
+| 8 | Backtesting Framework | A deterministic, event-driven backtester over historical klines that replays `analysis`+`lifecycle` and scores hypothetical outcomes. **Semantics fixed by `REPLAY_CONTRACT.md` v1.1** (Orchestrator reuse, H1-cadence replay at `T`/`T+1s`, row-slice windows, lifecycle capture, M5 outcome resolution, alert-instantiated trades). Architecture closed at M0; implementation M1–M11. |
+| 9 | Strategy Refinement | Fix the confirmed defects and weak heuristics (evidence-driven): OB quality/selection, HTF de-duplication, kill confirmation, decay semantics, TP/SL structure. |
+| 10 | Parameter Optimization | Calibrate thresholds (regime cutoffs, RR floor, ATR multiples, score weights, TTLs) against the backtester with walk-forward validation; guard against overfitting. |
+| 11 | Forward Testing | Paper/shadow-run the refined system live; compare predicted vs realized; measure hit-rate, expectancy, drawdown of the *advice*. |
+| 12 | Production | Promote the validated configuration; optional execution integration; monitoring, alerting, and a governed change process. |
 
-`v2/app/` is the last-built layer; it is not yet frozen (Phase 6 may touch it only
-for a genuine behavioral bug found during shadow validation, never for cleanup).
-
-**Reopening a frozen subsystem requires a new, explicitly-approved milestone.**
-
----
-
-## 11. Current Phase — Phase 6: Shadow Validation & Cutover
-
-**Objective.** Prove V2 is behaviorally identical to V1 in production conditions,
-then cut over. **No redesign, no optimization, no new features** — validation and
-documentation only.
-
-**Shadow validation (what must be demonstrated).**
-- Capture a **real golden dataset** first: `generate live` over a diverse window
-  (trending both directions, ranging, ≥1 regime transition, plus messy cases —
-  near-RR-floor, OB-questionable, KILL-latency). The committed synthetic fixture
-  proves plumbing only.
-- Run V1 and V2 **side by side on identical inputs** and diff, at minimum: signal,
-  score, notes, decision, reason, HTF, regime, entry, risk, lifecycle state,
-  memory, killed thesis, alerts, dashboard, OB-audit JSONL, terminal logs,
-  persistence, and notification payloads.
-- **Pass criterion:** zero divergence across the full field set over the window.
-- **Failure criterion:** any single-field divergence that is not an already-
-  sanctioned, documented divergence (error surfacing; M5 fetch cadence).
-
-**Cutover (only after zero-divergence).** Backup live JSON state → tag
-`v2-code-complete` → switch the production entrypoint to `Orchestrator.create()`
-→ observe → retire V1 (`main.py`, `src/`) → tag `v2-cutover`.
-
-**Rollback.** V1 remains byte-intact until `v2-cutover`; reverting is switching
-the entrypoint back and restoring the JSON backup. Git tag `v0.1.0` and the
-per-phase commits are the safety net.
-
-> Do not begin any new development. Phase 6 is validation + docs. STOP and wait
-> for approval before cutover.
+Details, acceptance criteria, and the improvement backlog are in the CHANGELOG's
+Strategy Evolution chapter.
 
 ---
 
-## 12. Important Notes (read before writing any code)
+## 7. Historical: the V1→V2 Migration (closed)
 
-1. **V1 is the source of truth for behavior.** If a doc and V1 disagree, V1 wins.
-   Read the actual `src/strategy.py` / `main.py`, don't trust summaries.
-2. **This IS a git repo now** (branch `main`, 12 commits, tag `v0.1.0`). One
-   commit per phase. Tag checkpoints; back up live JSON before cutover.
-3. **Use the venv Python:** `venv/Scripts/python.exe`. `pytest` is **not**
-   installed and must not be added — tests are stdlib `unittest`.
-4. **The harness deliberately does NOT cover everything.** It captures
-   analysis-level observables + a single-cycle persistence/notification
-   projection. Path-dependent lifecycle sequencing (miss_count, dedup/upgrade,
-   TTL, replace, OB-audit dedup) is covered by the **lifecycle replay tests**;
-   delivery formatting/routing by the **app tests**. End-to-end shadow diffing
-   over a real dataset is the Phase-6 step still outstanding.
-5. **Injected clock everywhere below app.** Never read the wall clock in
-   analysis/lifecycle. The orchestrator uses it only for `session_active`.
-6. **Serialization fidelity is exact.** The persisted `ActiveSignal` is a
-   **17-field** schema; V1's `load_memory` drops `entry_source` + `signal_id` and
-   coerces `score` to float on load (lossy **by design** — reproduce, don't fix).
-7. **Verified V1 quirks that must stay preserved:**
-   - Killed-thesis cooldown exists (`killed_thesis.json`, 1h / one closed H1).
-   - Same-thesis partial refresh does **NOT** reset `miss_count`/`last_miss_h1_ts`.
-   - Kill switch fires on **D1+H4 HTF bias flip** *and* on SL breach (+0.30·ATR).
-   - OB-audit dedup is an in-memory set owned by the orchestrator (Decision #010 —
-     `OBAuditRecord` is an observability contract, never read back into a decision).
-   - RAW-log score adds back the choppy penalty (pre-M5, pre-choppy value).
-   - OB-audit `location==""` and `window_bounds`/`selected_ob_*`/`current_price`
-     are always `None` (V1 key-name mismatch — reproduced faithfully).
-8. **Binding decisions:** `SMC-BOT-DOCS/05-decision-log.md` #001–#010. Notably
-   **#001** (Contract B) and **#010** (domain extensions + observability contract).
-9. **Stop discipline.** Each milestone ends with a STOP. Deliver the report,
-   update this file + `CHANGELOG.md`, and wait for approval. Do not chain phases.
+The repository began as **V1** (`main.py` + `src/`), a working but monolithic SMC
+radar. Between 2026-07-22 and 2026-07-25 it was re-architected into the layered V2
+above **without changing observable behavior**, proven at every step against V1
+(regression harness + per-layer V1 reference oracles). Milestones M0–M8: docs
+baseline → domain → infra → regression harness → analysis → lifecycle →
+orchestrator → delivery. The migration is complete; V2 is authoritative. Full
+engineering history is in `CHANGELOG.md`; the migration-era governing spec is in
+`SMC-BOT-DOCS/` (now historical reference, not an active constraint). Decisions
+#001–#010 (`SMC-BOT-DOCS/05-decision-log.md`) still explain *why* the code is
+shaped as it is — useful context, but no longer binding on new work.
 
 ---
 
-*End of PROJECT_STATE.md — update this file at every milestone boundary (§9).*
+## 8. Working Rules (current)
+
+1. **Evidence over intuition.** A strategy change ships only with a backtest /
+   forward-test result showing it helps (or is neutral with a sound rationale).
+   No "obvious improvements" merged blind.
+2. **One change at a time, measured.** Isolate each strategy change so its effect
+   is attributable. Keep the pipeline's purity and layer boundaries intact.
+3. **Preserve the architecture.** The layer rules (§2) still hold. New logic goes
+   in the layer that owns it; the orchestrator never gains a signal-deciding
+   branch; analysis/lifecycle stay clock-free and pure.
+4. **No new dependencies without approval.** Tests remain stdlib `unittest`.
+   pytest is not installed.
+5. **Characterization tests are a safety net, not a spec.** When you intend a
+   behavior change, update the affected tests deliberately (re-base on new
+   expected output) — never silently loosen them.
+6. **V1 is no longer the reference.** Do not add new "match V1" assertions. Retire
+   the V1 coupling as tests are re-based.
+7. **Live state is production data.** `active_pois.json`, `killed_thesis.json`,
+   `retracement_ob_audit.jsonl` — back up before schema changes.
+8. **One responsibility per living document.** `PROJECT_STATE.md` = current state
+   (this file). `CHANGELOG.md` = history. `STRATEGY_NOTES.md` = strategy knowledge
+   base (bugs, weaknesses, findings, decisions, experiment log).
+   `REPLAY_CONTRACT.md` = **binding** replay/outcome/backtest semantics (clause
+   numbers C-x.y; amendments bump its version). Do not duplicate their content
+   here — link to them.
+9. **One canonical replay specification.** `REPLAY_CONTRACT.md` v1.1 is the only
+   place replay semantics are defined. Any other document that touches replay
+   points at a clause number instead of restating it; if a needed fact is absent
+   from the contract, that is a contract defect and the fix is an amendment (a
+   version bump), never a local decision.
+
+---
+
+*End of PROJECT_STATE.md — update at every milestone boundary.*

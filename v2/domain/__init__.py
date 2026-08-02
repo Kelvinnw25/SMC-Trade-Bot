@@ -38,6 +38,7 @@ from v2.domain.ob_audit import OBAuditRecord
 from v2.domain.regime import Regime
 from v2.domain.risk import RiskPlan
 from v2.domain.signal import Signal, SignalCandidate
+from v2.domain.signal_ledger import LEDGER_SCHEMA_VERSION, SignalLedgerRecord
 from v2.domain.structure import FairValueGap, LiquiditySweep, OrderBlock, Swing
 
 __all__ = [
@@ -52,6 +53,7 @@ __all__ = [
     "IncrementMissMutation",
     "InsertMutation",
     "KilledThesisRecord",
+    "LEDGER_SCHEMA_VERSION",
     "LifecycleDecision",
     "LifecycleState",
     "LiquiditySweep",
@@ -67,6 +69,7 @@ __all__ = [
     "RiskPlan",
     "Signal",
     "SignalCandidate",
+    "SignalLedgerRecord",
     "Swing",
     "V1_REQUIRED_FIELDS",
 ]

@@ -67,6 +67,15 @@ killed_thesis.json
 retracement_ob_audit.jsonl
 
 # ==========================================================
+# Research data (M11) — corpora, runs, baselines
+# ==========================================================
+# The corpus is reproducible from its manifest and is far too large to track;
+# `corpus.json` records the identity (`corpus_id`, `data_snapshot_id`) that makes
+# a result quotable without the bytes. A frozen baseline that is *published* is
+# committed deliberately, by copying it out of here.
+data/
+
+# ==========================================================
 # Logs
 # ==========================================================
 *.log

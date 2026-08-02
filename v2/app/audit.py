@@ -15,19 +15,29 @@ candidate. The one arithmetic it does — the audit ``rr`` = |tp-entry|/|entry-s
 — is V1's own audit-line formula (main.py:505), a presentation field, not the
 scoring RR.
 
-Faithful V1 quirks preserved (verified against main.py:482-524 vs
-strategy.py:1784-1796 — the audit reads several keys the strategy never sets
-under those names, so they are ALWAYS None):
-- ``location``  → "" (V1 reads ``result.get("location","")``; ``result`` never
-  carries a "location" key);
-- ``window_bounds``, ``selected_ob_index/rank/top/bottom/size``, ``current_price``
-  → None (main.py reads ``selected_ob_*`` / ``window_bounds`` / ``current_price``
-  but strategy publishes ``ob_index`` / ``ob_top`` / … under different names).
+BUG-2 fix (post-migration, STRATEGY_NOTES.md / REPLAY_CONTRACT.md §12): V1's
+audit read keys the strategy never published under those names, so
+``location`` / ``window_bounds`` / ``selected_ob_*`` / ``current_price`` were
+ALWAYS empty — a key-name mismatch, not a design. The values were present on
+the same call; they are now recorded:
+- ``location``       ← the candidate's HTF location (V1 intended
+  ``result["location"]``, never set);
+- ``selected_ob_*``  ← the selected ``OrderBlock``'s index/rank/top/bottom/size;
+- ``window_bounds``  ← the OB scan window (``candidate_window`` over the same
+  prepared frame the OB stage scanned — the identical pure helpers, re-applied
+  to the immutable snapshot, not a re-analysis);
+- ``current_price``  ← the OB-filter reference price (the last CLOSED H1 close,
+  ``order_block.last_close`` — what selection actually reasoned against),
+  distinct from ``market_price`` (the live forming-candle close).
+The record remains write-only observability (Decision #010): no runtime module
+reads it back, so populating it cannot change any trading decision.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
+from v2.analysis.frames import H1_MIN_ROWS, safe_frame
+from v2.analysis.order_block import candidate_window, last_close
 from v2.domain import MarketSnapshot, OBAuditRecord, Signal
 from v2.lifecycle.rules import levels_valid
 
@@ -78,6 +88,15 @@ def assemble_ob_audit(
     risk = abs(entry_price - sl)
     rr = (abs(tp - entry_price) / risk) if risk > 0 else None
 
+    # BUG-2: the OB scan window and its reference price, recovered with the
+    # same pure helpers the OB stage used on the same immutable snapshot.
+    window_bounds: Optional[Tuple[int, int]] = None
+    current_price: Optional[float] = None
+    prepared_h1 = safe_frame(snapshot.h1, H1_MIN_ROWS)
+    if prepared_h1 is not None:
+        window_bounds = candidate_window(len(prepared_h1) - 1)
+        current_price = last_close(prepared_h1)
+
     return OBAuditRecord(
         symbol=snapshot.symbol,
         h1_last_ts=float(snapshot.h1_last_ts),
@@ -86,7 +105,7 @@ def assemble_ob_audit(
         decision=str(signal.decision),
         score=signal.score,
         regime=str(signal.regime),
-        location="",  # V1 quirk: result.get("location", "") is always ""
+        location=str(candidate.htf.location),
         market_price=float(snapshot.live_price),
         entry_price=entry_price,
         sl=sl,
@@ -95,16 +114,16 @@ def assemble_ob_audit(
         entry_source=str(entry.entry_source),
         tp_source=str(candidate.risk.tp_source),
         volume_spike=bool(candidate.volume_spike),
-        window_bounds=None,          # V1 quirk (key-name mismatch -> None)
+        window_bounds=window_bounds,
         ob_meta=ob_meta,
         ob_candidates=candidate.order_blocks,
-        selected_ob_index=None,      # V1 quirk
-        selected_ob_rank=None,       # V1 quirk
-        selected_ob_top=None,        # V1 quirk
-        selected_ob_bottom=None,     # V1 quirk
-        selected_ob_size=None,       # V1 quirk
+        selected_ob_index=selected.index if selected is not None else None,
+        selected_ob_rank=selected.rank_from_last if selected is not None else None,
+        selected_ob_top=selected.top if selected is not None else None,
+        selected_ob_bottom=selected.bottom if selected is not None else None,
+        selected_ob_size=selected.size if selected is not None else None,
         fresh_ob=bool(candidate.fresh_ob),
         fvg_valid=bool(candidate.fvg_valid),
-        current_price=None,          # V1 quirk
+        current_price=current_price,
         entry_equals_ob_bottom=entry_equals_ob_bottom,
     )

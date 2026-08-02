@@ -506,17 +506,14 @@ def plan_risk(
         tp_source = "fallback_2r"
         tp_rr = FALLBACK_RR
 
-    if entry.entry_mode == "CONTINUATION":
-        # V1 quirk (strategy.py:1522-1528): the continuation branch assigns
-        # `tp_source`/`tp_rr` inside the nested `_calc_continuation_entry`, which
-        # never declares them `nonlocal`, so those assignments stay local and the
-        # outer values (seeded None at 1471-1472) are what reach `h1_setup`. Only
-        # `tp` — returned explicitly in the tuple — survives. The retracement
-        # branch assigns them in the main body, so it keeps them. Preserved, not
-        # fixed: publishing the real source here would be a behavior change.
-        tp_source = None
-        tp_rr = None
-
+    # BUG-1 fix (post-migration, STRATEGY_NOTES.md / REPLAY_CONTRACT.md C-1.3):
+    # V1 dropped `tp_source`/`tp_rr` on the CONTINUATION path by accident (a
+    # missing `nonlocal` in its nested `_calc_continuation_entry`, strategy.py:
+    # 1522-1528 — the assignments never escaped, so the outer Nones were
+    # published). The values were always computed; discarding them was a scoping
+    # bug, not a design. Both fields are metadata only — nothing branches on
+    # them (they flow to alert text, the OB audit, and the signal ledger), so
+    # publishing them changes no score, decision, level, or lifecycle outcome.
     return RiskPlan(sl=float(sl), tp=float(tp), tp_source=tp_source, tp_rr=tp_rr)
 
 

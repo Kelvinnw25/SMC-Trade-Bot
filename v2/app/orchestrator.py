@@ -52,18 +52,20 @@ lifecycle behavior is unchanged.
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Callable, Optional
 
 from v2.analysis.context import AnalysisContext
 from v2.analysis.engine import V2Analyzer
 from v2.app.audit import AUDIT_ENTRY_MODE, assemble_ob_audit
+from v2.app.ledger import assemble_ledger_record
 from v2.app.rendering import render_dashboard, render_log_event, render_scan
 from v2.domain import LifecycleDecision, Signal
 from v2.infra.clock import Clock, SystemClock
-from v2.infra.market_data import MarketDataAdapter, MarketDataError
+from v2.infra.market_data import MarketDataAdapter, MarketDataError, MarketDataPort
 from v2.infra.notifier import Notifier, NotifierError, TelegramNotifier
-from v2.infra.persistence import PersistenceAdapter, PersistenceError
+from v2.infra.persistence import PersistenceAdapter, PersistenceError, PersistencePort
 from v2.lifecycle import LifecycleConfig, Reconciler, SignalStore
 
 __all__ = ["Orchestrator"]
@@ -86,14 +88,31 @@ class Orchestrator:
     `create()` builds the production wiring. `writer` is the terminal sink
     (default `print`); `sleeper` is the cadence sink (default `time.sleep`) —
     both injected so tests observe output/cadence without side effects.
+
+    ## Ports vs. concrete collaborators (Milestone M2)
+
+    Every I/O collaborator is typed as its **port**, never as a concrete adapter:
+    `Clock`, `MarketDataPort`, `PersistencePort`, `Notifier`, plus the two callable
+    sinks. This class therefore names no infra implementation except inside
+    `create()`, which is the one place production wiring belongs — so an alternative
+    data source or storage backend is substituted by construction, with nothing here
+    to change.
+
+    `analyzer` and `reconciler` are deliberately **concrete** (`V2Analyzer`,
+    `Reconciler`). They are not I/O: they are the public entry points of the
+    analysis and lifecycle layers, and `app -> analysis` / `app -> lifecycle` is the
+    sanctioned dependency direction (PROJECT_STATE.md §2). Inverting them would
+    invert the layering, not decouple it. Both are still *injected*, so a decorator
+    (e.g. one that records decisions) substitutes structurally without a Protocol
+    and without touching this class.
     """
 
     def __init__(
         self,
         *,
         clock: Clock,
-        market_data: MarketDataAdapter,
-        persistence: PersistenceAdapter,
+        market_data: MarketDataPort,
+        persistence: PersistencePort,
         notifier: Notifier,
         analyzer: V2Analyzer,
         config: LifecycleConfig = LifecycleConfig(),
@@ -104,6 +123,9 @@ class Orchestrator:
         fetch_pause_seconds: float = _FETCH_PAUSE_SECONDS,
         cycle_pause_seconds: float = _CYCLE_SLEEP_SECONDS,
         empty_pause_seconds: float = _EMPTY_SLEEP_SECONDS,
+        source: str = "live",
+        run_id: Optional[str] = None,
+        data_snapshot_id: Optional[str] = None,
     ) -> None:
         self._clock = clock
         self._market = market_data
@@ -122,19 +144,36 @@ class Orchestrator:
         # V1's in-memory `ob_audit_seen`: per-process, resets on restart
         # (Decision #010 — orchestrator-owned transient dedup state).
         self._ob_audit_seen: set = set()
+        # Ledger lineage (REPLAY_CONTRACT.md C-16.1/C-16.3.1). These are carried,
+        # never interpreted: no branch in this class or below reads them, so they
+        # cannot change a signal outcome, tier, or lifecycle transition
+        # (Principle 12 holds). `-1` so the first `run_cycle` is cycle 0.
+        self._source = source
+        self._run_id = run_id
+        self._data_snapshot_id = data_snapshot_id
+        self._cycle_index = -1
 
     # -- production wiring --------------------------------------------------
 
     @classmethod
     def create(cls, *, base_dir: str = ".") -> "Orchestrator":
         """Wire the real adapters (production). Not for tests — this constructs
-        the live `BinanceHandler` (network) via `MarketDataAdapter.create()`."""
+        the live `BinanceHandler` (network) via `MarketDataAdapter.create()`.
+
+        The live `run_id` is minted here, once per process, per REPLAY_CONTRACT.md
+        C-16.2 (`"live-<iso8601-utc>-<pid>"`). It is read from the same
+        `SystemClock` this wiring injects, so the clock stays the single time
+        source, and it is observability lineage only — nothing branches on it.
+        """
+        clock = SystemClock()
         return cls(
-            clock=SystemClock(),
+            clock=clock,
             market_data=MarketDataAdapter.create(),
             persistence=PersistenceAdapter(base_dir),
             notifier=TelegramNotifier(),
             analyzer=V2Analyzer(),
+            source="live",
+            run_id=f"live-{clock.now().strftime('%Y-%m-%dT%H:%M:%SZ')}-{os.getpid()}",
         )
 
     @property
@@ -167,6 +206,10 @@ class Orchestrator:
         """One full scan cycle. Returns True if the universe was processed,
         False on an empty/failed universe (V1's `if not top_coins: continue`,
         which skipped maintenance and saving that cycle)."""
+        # Ledger lineage only (C-16.3.1): every call consumes an index, including
+        # the ones that return False, so an empty-universe cycle is still a cycle.
+        self._cycle_index += 1
+
         if self._store is None:
             self.startup()
 
@@ -178,8 +221,12 @@ class Orchestrator:
         if not universe:
             return False
 
-        for entry in universe:
-            self._process_symbol(entry.symbol)
+        # `enumerate(..., 1)` records the 1-based processing order as ledger
+        # lineage (C-16.1 `universe_rank`). The iteration order itself is
+        # unchanged — it is the adapter's descending-volume order, which decides
+        # slot-cap and REPLACE outcomes and must never be re-sorted (C-5.6.2).
+        for rank, entry in enumerate(universe, 1):
+            self._process_symbol(entry.symbol, rank)
 
         self._end_of_cycle()
         return True
@@ -199,10 +246,13 @@ class Orchestrator:
 
     # -- per symbol ---------------------------------------------------------
 
-    def _process_symbol(self, symbol: str) -> None:
+    def _process_symbol(self, symbol: str, universe_rank: Optional[int] = None) -> None:
         """Analyze one symbol, reconcile it, and route its output — isolated
         from the rest of the scan. Any failure skips just this symbol (V1's
-        per-coin `try/except ... continue`, main.py:766-768)."""
+        per-coin `try/except ... continue`, main.py:766-768).
+
+        `universe_rank` is the symbol's 1-based position in this cycle's universe.
+        It is forwarded to the ledger record and nowhere else."""
         try:
             self._sleeper(self._fetch_pause)  # V1 inter-fetch rate limit (cadence)
             snapshot = self._market.get_market_snapshot(symbol, include_m5=True)
@@ -216,6 +266,14 @@ class Orchestrator:
                 AnalysisContext.initial(snapshot, session_active=session_active)
             )
             signal = self._analyzer.analyze(snapshot, session_active=session_active)
+
+            # Evaluation ledger (Phase 7.1): record EVERY completed analysis, all
+            # tiers, before any lifecycle/delivery step — so a completed analysis
+            # is captured even if a later step is skipped. Write-only; the record
+            # never re-enters a decision.
+            self._record_ledger(
+                snapshot, context, signal, session_active, universe_rank
+            )
 
             # kill/stale predicate biases: present only when a direction resolved
             # or vetoed (V1's context["htf_map"]); None -> "CHOPPY".
@@ -280,6 +338,38 @@ class Orchestrator:
         except PersistenceError:
             pass
         self._ob_audit_seen.add(key)
+
+    def _record_ledger(
+        self,
+        snapshot,
+        context,
+        signal: Signal,
+        session_active: bool,
+        universe_rank: Optional[int] = None,
+    ) -> None:
+        """Append the evaluation-ledger record for one completed analysis
+        (Phase 7.1). Best-effort: a `PersistenceError` is swallowed so a ledger
+        write never disturbs the scan. Write-only observability — the record is
+        assembled from analysis outputs and never read back into a decision.
+
+        The schema-2 lineage (C-16.1) is passed straight through: the constructor
+        values plus this cycle's index and the symbol's universe rank."""
+        record = assemble_ledger_record(
+            snapshot,
+            context,
+            signal,
+            session_active=session_active,
+            recorded_at=self._clock.timestamp(),
+            source=self._source,
+            run_id=self._run_id,
+            cycle_index=self._cycle_index,
+            universe_rank=universe_rank,
+            data_snapshot_id=self._data_snapshot_id,
+        )
+        try:
+            self._persistence.append_signal_ledger(record)
+        except PersistenceError:
+            pass
 
     # -- coordination helpers ----------------------------------------------
 

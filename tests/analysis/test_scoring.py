@@ -19,6 +19,7 @@ No network, no Telegram, no filesystem writes.
 """
 from __future__ import annotations
 
+import dataclasses
 import random
 import unittest
 from pathlib import Path
@@ -273,10 +274,40 @@ class TestRegressionCompatibility(unittest.TestCase):
         self.assertTrue(report.ok, _diff(report))
 
     def test_bridge_matches_v1oracle_across_the_corpus(self):
+        # One deliberate divergence from V1 is carved out (BUG-1, re-based;
+        # REPLAY_CONTRACT.md C-1.3): on a READY CONTINUATION V1 published
+        # tp_source/tp_rr = None by a scoping accident; V2 now publishes the
+        # real provenance. There the V1-side Nones are replaced by V2's values
+        # after asserting V2 actually publishes them — every other field is
+        # still compared exactly.
         for name, d1, h1 in corpus():
             snapshot = snapshot_of(d1, h1)
             expected = V1Oracle().analyze(snapshot)  # fresh: see v1_context
             actual = v2_observable(snapshot, session_active=SESSION_ACTIVE)
+            if (
+                expected.entry_mode == "CONTINUATION"
+                and expected.entry_ready
+                and expected.tp_source is None
+            ):
+                with self.subTest(frame=name, divergence="bug1"):
+                    self.assertIsNotNone(actual.tp_source)
+                    self.assertIsNotNone(actual.tp_rr)
+                # The same accidental None also reaches V1's notification
+                # projection ("TP Src: -"); normalize that nested key too.
+                notification = expected.notification
+                if notification is not None and "tp_source" in notification:
+                    notification = dict(notification)
+                    notification["tp_source"] = (
+                        actual.notification.get("tp_source")
+                        if actual.notification is not None
+                        else notification["tp_source"]
+                    )
+                expected = dataclasses.replace(
+                    expected,
+                    tp_source=actual.tp_source,
+                    tp_rr=actual.tp_rr,
+                    notification=notification,
+                )
             report = compare_observables(expected, actual, label=name)
             with self.subTest(frame=name):
                 self.assertTrue(report.ok, _diff(report))
