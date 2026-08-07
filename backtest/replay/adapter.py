@@ -308,10 +308,32 @@ class HistoricalMarketDataAdapter:
         trailing **24 closed H1 candles** — not the symbols that happen to rank
         today, which would bake survivorship and look-ahead into every result.
 
-        **Eligibility.** A symbol participates only with a full 24 rows at `T`.
-        A partial sum would systematically under-rank new listings and make their
-        entry into the universe depend on when the run window starts; they enter
-        naturally once a full day exists.
+        **Eligibility.** A symbol participates only with a full 24 rows at `T`
+        **whose newest row opens inside the trailing day**. A partial sum would
+        systematically under-rank new listings and make their entry into the
+        universe depend on when the run window starts; they enter naturally once
+        a full day exists.
+
+        The recency half of that test is finding A1. `KlineRepository.window` is
+        C-6.3 verbatim and therefore **row-based, never time-based**: it returns
+        the last 24 *stored* rows at or before `T`, however old they are. That is
+        right for frames, where a gap must not be padded, but for ranking it
+        silently turns "no data at `T`" into "an arbitrary sum from the past". A
+        delisted instrument kept returning 24 rows frozen at its final candle and
+        so held a top-30 slot forever: measured on the step 7 shakedown,
+        LUNAUSDT ranked 1-5 at all 744 cycles on volume 5,585-7,868 hours stale,
+        with ANCUSDT and KEEPUSDT behind it. Live cannot do this — it ranks from
+        `/fapi/v1/ticker/24hr`, which lists only trading instruments — so the
+        divergence was undeclared and unbounded.
+
+        The test constrains where the window **ends**, and only that: 24 rows
+        spanning a gap still cover more than a day, so the sum is "the trailing 24
+        candles", not "exactly 24 hours". That residue is pre-existing and
+        measured — across the whole declared replay window (2023-01-01 ->
+        2026-07-05) the corpus holds **three** gaps longer than an hour
+        (TLMUSDT 12 h, MINAUSDT 11 h, AERGOUSDT 11 h) and **none** of 24 h or
+        more, so no live symbol is ever suspended by this test and no window
+        stretches by more than half a day.
 
         **Tie-break.** Live sorts the exchange's ticker list with Python's stable
         sort, so equal volumes keep the API's response order — which is not
@@ -320,6 +342,11 @@ class HistoricalMarketDataAdapter:
         out in name order and the universe is a pure function of the data.
         """
         boundary_ms = self._require_boundary() * _SECOND_MS
+        # Closed-candle arithmetic only: the earliest open time that still lies
+        # in the trailing day at `T`. No row after `T` is read, and no property
+        # of the future is consulted, so the test is causal by construction.
+        trailing_start_ms = (
+            boundary_ms - UNIVERSE_TRAILING_ROWS * _H1_SECONDS * _SECOND_MS)
         candidates: list[tuple[str, float]] = []
         try:
             names = self._universe_candidates()
@@ -327,6 +354,10 @@ class HistoricalMarketDataAdapter:
                 rows = self._window(
                     native, "1h", boundary_ms, UNIVERSE_TRAILING_ROWS)
                 if rows is None or len(rows) < UNIVERSE_TRAILING_ROWS:
+                    continue
+                if int(rows["timestamp"][-1]) < trailing_start_ms:
+                    # Stale: the newest closed candle predates the trailing day,
+                    # so there is no trailing-24h volume to rank on (A1).
                     continue
                 candidates.append((native, float(rows["qv"].sum())))
         except MarketDataError as exc:
@@ -410,12 +441,23 @@ class HistoricalMarketDataAdapter:
           of the 30 universe slots. Live has excluded them since the Phase 0
           freeze; the adapter had never been brought along.
 
-        What is deliberately *not* filtered is current listing status. A symbol
-        delisted today was tradeable at its own boundaries, and the corpus
-        already says so by holding rows for it; a symbol with no rows at `T`
-        fails the 24-row gate above and cannot rank. Excluding delisted
-        instruments here would reintroduce exactly the survivorship bias C-6.9
-        exists to prevent.
+        What is deliberately *not* filtered is current listing status, and that
+        remains right: a symbol delisted today was tradeable at its own
+        boundaries, the corpus already says so by holding rows for it, and
+        excluding delisted instruments *here* would reintroduce exactly the
+        survivorship bias C-6.9 exists to prevent. Listing status is a fact about
+        **now**; candidate selection may not consult it.
+
+        This docstring used to add that "a symbol with no rows at `T` fails the
+        24-row gate above and cannot rank". **That was false, and finding A1 is
+        what it cost.** `KlineRepository.window` is row-based (C-6.3), so a dead
+        symbol keeps returning its final 24 candles at every later `T`, passes the
+        row gate, and ranks on frozen volume — LUNAUSDT held rank 1-5 at all 744
+        cycles of the step 7 shakedown. Staleness is a fact about the **data at
+        `T`**, not about listing status, so it is tested where the volume is
+        actually computed: `get_top_volume_symbols` requires the newest of those
+        24 rows to open at or after `T - 24h`. The two filters are complementary,
+        and neither substitutes for the other.
         """
         if self._static_universe is not None:
             return tuple(self._static_universe)

@@ -33,6 +33,7 @@ __all__ = [
     "RunLineage",
     "STRATEGY_VERSION",
     "environment",
+    "optimizations",
     "read_run_lineage",
 ]
 
@@ -52,8 +53,44 @@ MANIFEST_FILENAME = "manifest.json"
 #: Definition changes. See finding R5 (M7) and PHASE0_FREEZE.md.
 from v2.app.ledger import STRATEGY_VERSION
 
+#: The swing implementation actually in force, read live rather than bound at
+#: import time so the manifest records the value the run used, not the value the
+#: module held when it was first imported.
+#:
+#: Imported *here* and not in `backtest/replay/`: the driver's `v2` imports are a
+#: closed allowlist (`test_the_driver_contains_no_strategy_logic`), and widening
+#: it to admit an analysis module — to write one provenance boolean — would trade
+#: an architectural guarantee for a convenience. This module is already the
+#: project's provenance layer and already re-exports `STRATEGY_VERSION` from
+#: `v2.app.ledger`, so the dependency is one it holds by definition.
+from v2.analysis import structure as _swings
+
 #: The libraries whose version can change a float result (§18).
 _TRACKED = ("pandas", "pandas_ta", "numpy")
+
+
+def optimizations(*, caching_analyzer: bool) -> dict[str, bool]:
+    """The optimization provenance block of the run manifest.
+
+    Recorded **outside** C-16.2's `core`, exactly as `universe_id` is: the claim
+    each flag makes is that it cannot change a result, and putting it in `core`
+    would assert the opposite — that two runs differing only in it are not
+    comparable. A cached-vs-uncached or v1-vs-vectorized comparison therefore
+    excludes this key along with the two wall-clock keys; it *is* the variable
+    under test.
+
+    `caching_analyzer` is run configuration and is passed in. `vectorized_swings`
+    is not configuration at all — it is the state of the C-8.5 rollback seam
+    (`analysis.structure.SWING_IMPL`), which a run cannot choose and an operator
+    changes only by editing the module. It is recorded because a rolled-back
+    baseline would otherwise be indistinguishable from a vectorized one in its
+    own manifest, and `git_commit` does not close that gap: it reads `.git/HEAD`
+    and carries no dirty-tree flag.
+    """
+    return {
+        "caching_analyzer": bool(caching_analyzer),
+        "vectorized_swings": _swings.SWING_IMPL == "vectorized",
+    }
 
 
 def environment() -> dict[str, str]:

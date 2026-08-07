@@ -68,6 +68,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from backtest.capture_schema import (
+    ALERTS_FILENAME,
     CapturedEvent,
     KIND_ALERT,
     KIND_KILLED_THESIS,
@@ -101,8 +102,6 @@ __all__ = [
     "RecordingReconciler",
     "TTL_RENDERED_MARKER",
 ]
-
-ALERTS_FILENAME = "alerts.jsonl"
 
 H1_SECONDS = 3600
 

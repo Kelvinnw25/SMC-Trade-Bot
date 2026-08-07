@@ -991,12 +991,50 @@ The orchestrator evaluates the pipeline twice per symbol
 the observability/kill context, once inside `analyze`. Both are pure functions of
 `(snapshot, session_active)`.
 
-A `CachingAnalyzer` memoizing `pipeline.run` and `analyze` on the key
-`(symbol, h1_last_ts, session_active)` is therefore **semantically transparent** and
-permitted as a dependency swap. Measured effect: ~214 ms → ~107 ms per symbol-scan.
-Requirements: keyed exactly as above; cleared or keyed per `data_snapshot_id`;
-covered by a test asserting cached and uncached runs produce byte-identical output
-bundles.
+A `CachingAnalyzer` memoizing the analysis pipeline is therefore **semantically
+transparent** and permitted as a dependency swap. Measured effect: ~214 ms →
+~107 ms per symbol-scan (implementation measured 207.82 ms → 106.86 ms on the
+top-30 universe at 2024-07-01).
+
+**Amendment, approved 2026-08-03 — the key.** This clause originally specified
+`(symbol, h1_last_ts, session_active)`. That key is **unsafe** and MUST NOT be
+used: it under-determines the snapshot. During an H1 gap `h1_last_ts` freezes for
+hours while `d1`, `m5` and `live_price` advance, and the Stage 2 corpus holds
+6,204 gap hours across 52 symbols. Two cycles with genuinely different snapshots
+therefore collide on it and the cache serves a Signal built for another `T` —
+violating I-8 silently. Step 4's T4.1 control demonstrates the collision on a
+corpus-derived fixture (`DYDX/USDT` across the 2023-03-15T12:00Z gap): the
+original key collides on all three cycles and returns a wrong Signal.
+
+The **required** key is every snapshot component analysis can read:
+
+```
+(data_snapshot_id, symbol, h1_last_ts, len(h1), d1_last_ts, len(d1),
+ m5_last_ts, len(m5), bit-pattern of live_price, session_active)
+```
+
+`live_price` enters as its IEEE **bit pattern**, not its value, so `0.0` and
+`-0.0` stay distinct and NaN compares equal to itself — neither of which `==`
+provides. `MarketSnapshot` cannot serve as its own key: `d1`/`h1`/`m5` are
+declared `field(compare=False)` ([market.py:39-44](v2/domain/market.py#L39)), so
+the determinant is built explicitly.
+
+The memo wraps **`AnalysisPipeline`**, not `analyze`. The orchestrator calls both
+seams ([orchestrator.py:265-268](v2/app/orchestrator.py#L265)), so memoizing
+`analyze` alone would leave the first evaluation unpaid; wrapping the pipeline
+puts the entry underneath both. It also keeps V1's M5 re-score gate (`score >= 8`
+and an M5 frame present) inside `v2/`, executed every call, rather than
+reimplemented in `backtest/` where it could drift.
+
+Requirements: keyed exactly as above; keyed per `data_snapshot_id` (satisfied by
+its presence in the key); the `prior` argument bypasses the cache; covered by a
+test asserting cached and uncached runs produce byte-identical output bundles.
+Verified: a 169-cycle `corpus-pilot` replay, all 9 bundle files identical, and
+the same result at 30,768 cycles in Shakedown B. The flag is
+`ReplayConfig.caching_analyzer` / `--caching`, **default off**, and is
+deliberately **absent from C-16.2 `core`** — the claim being made is that
+memoization cannot change a result, so two runs differing only in it must share a
+`run_id`; a comparison therefore requires different `output_root`s.
 
 ### C-8.5 Performance envelope (measured, informative)
 
@@ -1591,9 +1629,31 @@ so a diff of two lines stays readable.
 - **Replay (deterministic):**
   `run_id = "replay-" + sha256(canonical_json(core))[:16]`, where `core` is
   `{contract_version, strategy_version, ledger_schema_version, data_snapshot_id,
-  T_0, T_n, burn_in_h1, universe_mode, top_coins_limit, lifecycle_config,
-  outcome_config_hash, env}`. Identical inputs ⇒ identical `run_id`, so re-runs are
-  idempotent and any drift surfaces immediately as a new id.
+  T_0, T_n, burn_in_h1, universe_mode, static_universe, top_coins_limit,
+  lifecycle_config, outcome_config_hash, env}`. Identical inputs ⇒ identical
+  `run_id`, so re-runs are idempotent and any drift surfaces immediately as a new
+  id.
+
+**Amendment, approved 2026-08-03 — what `core` does and does not contain.**
+`static_universe` is named above because a pinned universe changes which symbols
+are scanned and therefore the result; it was present in the implementation from
+M13 and is recorded here so the closed list matches it exactly.
+
+Three values are recorded in the run manifest **outside** `core`, and their
+exclusion is deliberate rather than an omission:
+
+| Manifest key | Why outside `core` |
+|---|---|
+| `universe_id` | The identity of the Universe Definition resolution (C-6.9), resolved by `backtest.universe` and injected. It *can* change which symbols are ranked, so a stricter contract would include it — but `core` is a closed list this clause owns, and widening it would retroactively change every recorded `run_id`. The consequence is stated rather than hidden: **two runs differing only in `universe_id` produce the same `run_id` and therefore the same output directory.** The mitigation is that `universe_id` is written to the manifest and to every ledger row's lineage, so a mismatch is detectable after the fact. Gate B verified the value is stable across Stage 1 → Stage 2 (`7fd26361c467d048`, `added=0 removed=0 changed=0`), so no baseline is exposed to it. |
+| `optimizations.caching_analyzer` | C-8.4. The claim is that memoization cannot change a result; putting it in `core` would assert the opposite. |
+| `optimizations.vectorized_swings` | C-8.5. The state of `analysis.structure.SWING_IMPL`, not run configuration; same reasoning. |
+
+A cached-vs-uncached or v1-vs-vectorized comparison therefore points the two arms
+at different `output_root`s and excludes `optimizations` from the manifest diff
+along with `generated_at` and `wall_seconds` — those keys *are* the variable under
+test. Changes to the ranking **rule** are not covered by this exclusion: they are
+strategy behaviour and surface through `strategy_version`, which *is* in `core`
+(see finding A1 and `STRATEGY_VERSION` 2.2.0).
 - **Live (not deterministic, and need not be):**
   `run_id = "live-" + iso8601_utc(process_start) + "-" + pid`, generated once per
   process and stamped on every row of that process.

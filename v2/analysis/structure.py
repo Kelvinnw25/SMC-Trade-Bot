@@ -74,6 +74,12 @@ _VOLUME_SMA_WINDOW = 20
 _VOLUME_SPIKE_MULT = 1.5
 
 
+#: Rollback seam (IMPLEMENTATION_PLAN Step 5 §7). `"v1"` restores the original
+#: nested-loop implementation, which stays in the tree permanently as the
+#: differential oracle. Changing this constant is the whole rollback.
+SWING_IMPL = "vectorized"
+
+
 def identify_swings(
     df: pd.DataFrame, window: int, prominence_mult: float
 ) -> Tuple[list, list]:
@@ -83,10 +89,14 @@ def identify_swings(
     the existing `atr` column for the prominence floor; when the frame has no
     `atr` column (V1's resampled H4 frame) the mean is 0.0, which disables
     prominence filtering exactly as it does in V1.
-    """
-    swing_highs: list = []
-    swing_lows: list = []
 
+    The prologue below is **frozen by C-8.5**: `atr_mean` MUST keep using
+    ``df["atr"].dropna().mean()``, because pandas' pairwise summation differs
+    from a sequential sum in 4,506 of 5,000 realistic 499-element ATR arrays.
+    It stays in this function, unmoved, and both implementations receive the
+    `min_prominence` it produces. `tests/analysis/test_swings_differential.py`
+    asserts the line's source text (T5.4).
+    """
     if "atr" in df.columns and not df["atr"].dropna().empty:
         atr_mean = float(df["atr"].dropna().mean())
     else:
@@ -94,6 +104,23 @@ def identify_swings(
     if not math.isfinite(atr_mean):
         atr_mean = 0.0
     min_prominence = atr_mean * prominence_mult
+
+    if SWING_IMPL == "v1":
+        return _swings_v1(df, window, prominence_mult, min_prominence)
+    return _swings_vectorized(df, window, prominence_mult, min_prominence)
+
+
+def _swings_v1(
+    df: pd.DataFrame, window: int, prominence_mult: float, min_prominence: float
+) -> Tuple[list, list]:
+    """The original nested-loop body, unchanged. Permanent differential oracle.
+
+    Retained rather than deleted because a vectorized rewrite is only auditable
+    against the implementation it replaced, and `src/strategy.py` is V1's copy —
+    not this project's. Reachable in production via `SWING_IMPL = "v1"`.
+    """
+    swing_highs: list = []
+    swing_lows: list = []
 
     for i in range(window, len(df) - window):
         is_high, is_low = True, True
@@ -137,6 +164,130 @@ def identify_swings(
                 and swing_lows[-1]["index"] == i - 1
             ):
                 swing_lows.append({"index": i, "price": df["low"].iloc[i]})
+
+    return swing_highs, swing_lows
+
+
+def _shift(series: pd.Series, start: int, stop: int) -> pd.Series:
+    """`series[start:stop]` re-based onto a 0..n-1 index so slices align."""
+    return series.iloc[start:stop].reset_index(drop=True)
+
+
+def _window_extreme(
+    series: pd.Series, lo: int, hi: int, window: int, *,
+    side: int, minimum: bool,
+) -> pd.Series:
+    """The min/max over the `window` neighbours on one side of each centre.
+
+    V1 uses `Series.min()` / `Series.max()`, which **skip** NaN and return NaN
+    only when every element is NaN. `DataFrame.min(axis=1)` has exactly those
+    semantics (`skipna=True` is the default), so stacking the `window` shifted
+    slices column-wise and reducing across them reproduces V1 element for
+    element — including the all-NaN case, which is hazard 1.
+
+    Deliberately pandas-only: `v2/analysis` may not import numpy
+    (`tests/analysis/test_analysis_purity.py`), and every primitive needed here
+    exists on `Series`/`DataFrame`.
+    """
+    columns = [
+        _shift(series, lo + (-j if side < 0 else j), hi + (-j if side < 0 else j))
+        for j in range(1, window + 1)
+    ]
+    stacked = pd.concat(columns, axis=1)
+    return stacked.min(axis=1) if minimum else stacked.max(axis=1)
+
+
+def _swings_vectorized(
+    df: pd.DataFrame, window: int, prominence_mult: float, min_prominence: float
+) -> Tuple[list, list]:
+    """The same decisions as `_swings_v1`, evaluated column-wise.
+
+    Only the *selection* is vectorized. The consecutive-equal suppression stays a
+    sequential loop because it reads back the element it just appended, and it
+    now runs over the surviving candidates only rather than every row.
+
+    ## The three hazards, and the primitive each one mandates
+
+    1. **`Series.min()` skips NaN, a plain elementwise min propagates it.**
+       Handled in `_window_extreme` via `DataFrame.min(axis=1)`, which has
+       `Series.min()`'s exact `skipna` semantics — never a bare `min`.
+    2. **Python's `max(a, b)` is `b if b > a else a`** — asymmetric on NaN, so
+       `max(nan, 5)` is `nan` while `max(5, nan)` is `5`. An elementwise maximum
+       propagates NaN in both directions and is therefore **wrong here**; the
+       comparison is written out as `left.mask(right > left, right)`. The same
+       applies to `min`, written as `left.mask(right < left, right)`.
+    3. **`n <= 2 * window` is tested first.** The shifted form would produce a
+       zero-length right operand where V1's `range()` is simply empty and returns
+       `([], [])`.
+
+    ## Types are part of the contract
+
+    `index` must be a Python `int` and `price` whatever `.iloc[i]` yields
+    (`numpy.float64` for the float64 price columns). Positions come from a
+    `RangeIndex` and are passed through `int()`; prices are still read with
+    `.iloc[i]`, so their type cannot drift. T5.1a compares `type(...)` for
+    exactly this reason.
+
+    Deliberately pandas-only — `v2/analysis` may not import numpy
+    (`tests/analysis/test_analysis_purity.py`), and nothing here needs it.
+    """
+    swing_highs: list = []
+    swing_lows: list = []
+
+    n = len(df)
+    if n <= 2 * window:                            # hazard 3 — must come first
+        return swing_highs, swing_lows
+
+    high = df["high"]
+    low = df["low"]
+    lo, hi = window, n - window
+    centre_high = _shift(high, lo, hi)
+    centre_low = _shift(low, lo, hi)
+
+    # is_high == NOT any(h[i] < h[i-j] or h[i] < h[i+j]). A comparison against
+    # NaN is False in pandas exactly as in Python, so a NaN neighbour
+    # disqualifies nothing — which is V1's behaviour, not an accident of it.
+    disqualified_high = pd.Series(False, index=centre_high.index)
+    disqualified_low = pd.Series(False, index=centre_low.index)
+    for j in range(1, window + 1):
+        disqualified_high |= centre_high < _shift(high, lo - j, hi - j)
+        disqualified_high |= centre_high < _shift(high, lo + j, hi + j)
+        disqualified_low |= centre_low > _shift(low, lo - j, hi - j)
+        disqualified_low |= centre_low > _shift(low, lo + j, hi + j)
+
+    is_high = ~disqualified_high
+    is_low = ~disqualified_low
+
+    if prominence_mult > 0:
+        left_low = _window_extreme(low, lo, hi, window, side=-1, minimum=True)
+        right_low = _window_extreme(low, lo, hi, window, side=+1, minimum=True)
+        reference = left_low.mask(right_low > left_low, right_low)   # Python max
+        # `prominence < min_prominence` is False when prominence is NaN, so the
+        # candidate survives — as it does in V1.
+        is_high &= ~((centre_high - reference) < min_prominence)
+
+        left_high = _window_extreme(high, lo, hi, window, side=-1, minimum=False)
+        right_high = _window_extreme(high, lo, hi, window, side=+1, minimum=False)
+        reference = left_high.mask(right_high < left_high, right_high)  # Python min
+        is_low &= ~((reference - centre_low) < min_prominence)
+
+    # Frozen: consecutive-equal suppression, sequential and order-dependent.
+    for position in is_high[is_high].index:
+        i = int(position) + lo
+        price = high.iloc[i]
+        if not swing_highs or not (
+            swing_highs[-1]["price"] == price
+            and swing_highs[-1]["index"] == i - 1
+        ):
+            swing_highs.append({"index": i, "price": price})
+    for position in is_low[is_low].index:
+        i = int(position) + lo
+        price = low.iloc[i]
+        if not swing_lows or not (
+            swing_lows[-1]["price"] == price
+            and swing_lows[-1]["index"] == i - 1
+        ):
+            swing_lows.append({"index": i, "price": price})
 
     return swing_highs, swing_lows
 

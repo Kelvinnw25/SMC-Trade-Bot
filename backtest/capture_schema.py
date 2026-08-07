@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 __all__ = [
+    "ALERTS_FILENAME",
     "ATTRIBUTIONS",
     "CAPTURE_SCHEMA_VERSION",
     "CapturedEvent",
@@ -61,6 +62,13 @@ CAPTURE_SCHEMA_VERSION = 1
 
 LIFECYCLE_EVENTS_FILENAME = "lifecycle_events.jsonl"
 MEMORY_SNAPSHOTS_FILENAME = "memory_snapshots.jsonl"
+
+#: C-15.7's cross-check channel. Declared here for the reason the module
+#: docstring gives for the other two: `backtest.audit` reads it and
+#: `backtest.replay.capture` writes it, and a reader that had to import the
+#: writer to learn a filename would couple the audit to the thing it audits.
+#: `capture` re-exports it, so every existing import keeps working.
+ALERTS_FILENAME = "alerts.jsonl"
 
 KIND_MUTATION = "MUTATION"
 KIND_LOG = "LOG"

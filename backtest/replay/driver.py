@@ -62,13 +62,14 @@ from backtest.data.repository import (
 from backtest.capture_schema import (
     LIFECYCLE_EVENTS_FILENAME, MEMORY_SNAPSHOTS_FILENAME,
 )
+from backtest.lineage import optimizations
 from backtest.replay.adapter import HistoricalMarketDataAdapter
 from backtest.replay.capture import CaptureRecorder, RecordingReconciler
 from backtest.replay.config import H1_SECONDS, ReplayConfig
 from backtest.replay.sinks import (
     ALERTS_FILENAME, RecordingNotifier, ReplayPersistence,
 )
-from v2.analysis.engine import V2Analyzer
+from backtest.replay.caching import build_analyzer
 from v2.app.orchestrator import Orchestrator
 from v2.infra.clock import FakeClock
 from v2.lifecycle import Reconciler
@@ -427,7 +428,8 @@ class ReplayDriver:
             market_data=adapter,
             persistence=persistence,
             notifier=notifier,
-            analyzer=V2Analyzer(),
+            analyzer=build_analyzer(caching=config.caching_analyzer,
+                                    data_snapshot_id=self.data_snapshot_id),
             config=config.lifecycle_config,
             top_coins_limit=config.top_coins_limit,
             # C-15.2 / R-6: the one production seam capture uses — the injection
@@ -648,6 +650,17 @@ class ReplayDriver:
             # because C-16.2's `core` is a closed list — see `ReplayConfig`.
             "universe_id": self._config.universe_id,
             "universe_size": len(self._config.eligible or ()),
+            # Optimization provenance. Outside `core` for the same reason
+            # `universe_id` is: the claim these flags make is that they do not
+            # change results, and `core` is C-16.2's closed list. A
+            # cached-vs-uncached comparison therefore excludes this key along
+            # with the two wall-clock keys — it *is* the variable under test.
+            #
+            # Assembled by `backtest.lineage`, not here: `vectorized_swings`
+            # reads `analysis.structure`, and this package's `v2` imports are a
+            # closed allowlist that must not be widened for a provenance field.
+            "optimizations": optimizations(
+                caching_analyzer=self._config.caching_analyzer),
             "builder_version": self._repository.builder_version,
             "repository_root": str(self._repository.root),
             "cycles": result.cycles,
@@ -682,6 +695,11 @@ _DECLARED_BIASES = [
     "before hh:05 (C-5.5.2)",
     "universe ranking is hourly and closed-only, whereas live uses Binance's "
     "rolling 24h ticker including the forming hour (C-6.9)",
+    "a symbol with no closed candle in the trailing 24h is dropped from the "
+    "ranking, whereas live's ticker still lists it and ranks it at ~0 volume "
+    "(A1). Exclusion and rank-at-zero differ only when fewer than "
+    "top_coins_limit symbols hold recent data; the declared window's candidate "
+    "pool is 148-768, so the ranked universe is never short (C-6.9)",
 ]
 
 

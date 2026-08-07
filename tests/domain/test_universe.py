@@ -92,7 +92,9 @@ class TestFrozenSurface(unittest.TestCase):
     def test_strategy_version_reflects_the_universe_freeze(self):
         from v2.app.ledger import STRATEGY_VERSION
 
-        self.assertEqual(STRATEGY_VERSION, "2.1.0")
+        # 2.1.0 was the Phase 0 freeze; 2.2.0 adds finding A1's recency test to
+        # replay's C-6.9 reconstruction. Both change which symbols are scanned.
+        self.assertEqual(STRATEGY_VERSION, "2.2.0")
 
     def test_replay_and_backtest_agree_on_strategy_version(self):
         # They drifted once: manifests said "v2.0" while the ledger rows inside

@@ -5,16 +5,148 @@
 > - **Status:** Migration complete. V2 is the **only** implementation and the
 >   authoritative system. **Phase 8 architecture is closed** (Milestone M0);
 >   implementation starts at M1.
-> - **Last updated:** 2026-08-02
-> - **Doc version:** 3.8
+> - **Last updated:** 2026-08-06
+> - **Doc version:** 3.15
+> - **Steps 0-8 are COMPLETE. Step 9 (Official Replay) is NEXT.**
+>
+>   | Item | Status | Evidence |
+>   |---|---|---|
+>   | Gate A — Stage 2 acquisition | **PASS** | `corpus verify` PASS · TA.3 reviewed · TA.4 1h invariant preserved |
+>   | Step 4 — `CachingAnalyzer` | **PASS** | 1.91x; all 9 bundle files byte-identical |
+>   | Step 5 — vectorized `identify_swings` | **PASS** | 586,684 bit-exact comparisons, 0 mismatches; 4.18x alone, 7.22x with Step 4 |
+>   | Gate B — Step 6 coverage re-run | **PASS / CLOSED** | 2023-01-01 PASS; `universe_id` unchanged, `added=0 removed=0 changed=0`; TB.5 signed off |
+>   | Shakedown A2 — Step 7 | **PASS** | `replay-e6ff984d844e5ae4` · 744 cycles · 0 crashes, 0 swallowed, 0 `universe_error` |
+>   | Shakedown B — Step 8 | **PASS** | `replay-b56115479c642a43` · 30,768 cycles · exact lifecycle reconstruction every cycle |
+>
+>   **Official replay target (frozen 2026-08-06):** `T_0 = 2023-01-01T00:00:00Z`
+>   (1672531200) → **`T_n = 2026-06-28T23:00:00Z` (1782687600)**, 30,600
+>   boundaries, `burn_in_h1 = 336`, `universe_mode = volume`, `top_coins_limit =
+>   30`, `caching_analyzer = true`, `vectorized_swings = true`. `T_n` is exactly
+>   168 h — `OutcomeConfig.max_holding_h1` — before the corpus's last boundary, so
+>   every trade resolves and there is no `OPEN` tail to censor. Full specification
+>   and evidence: `PHASE0_FREEZE.md` §9. Projected wall clock **7.7 h** at the
+>   measured 30.2 ms per symbol-cycle.
+>
+>   **All frozen-document patches are applied.** C-8.4 (the implemented cache key)
+>   and C-16.2 (`static_universe` in `core`; `universe_id` and `optimizations`
+>   recorded outside it) are amended in `REPLAY_CONTRACT.md`; `STRATEGY_VERSION`
+>   2.2.0, the A1 fix, the selected window and the optimization provenance block
+>   are recorded in `PHASE0_FREEZE.md`. No documentation debt remains before
+>   step 9.
+> - **`STRATEGY_VERSION` is 2.2.0** (finding A1). Replay's C-6.9 universe
+>   reconstruction ranked delisted instruments on frozen volume, because
+>   `KlineRepository.window` is row-based (C-6.3) and kept returning a dead
+>   symbol's final 24 candles at every later `T`. `get_top_volume_symbols` now
+>   also requires the newest of those rows to open at or after `T - 24h`. The live
+>   path is unchanged. The bump is required because `core()` carries no harness
+>   version, so without it two runs either side of the fix would share a `run_id`
+>   (C-5.7.2). **Shakedown A must be re-run before Shakedown B** (PHASE0 §6);
+>   `corpus_id`, `data_snapshot_id` and `universe_id` are unaffected, so Gate A
+>   and Gate B stand. Shakedown A was re-run as A2 and passed; the `2.2.0` row is
+>   recorded in `PHASE0_FREEZE.md`'s version history beside the `2.1.0` Universe
+>   Freeze entry, with the A1 detail beneath it.
+>
+>   The bump is an **approved exception to C-16.3.1** (user, 2026-08-03), which
+>   otherwise confines `v2/` edits to the M1 lineage set and the C-8.5 work. Its
+>   scope is that one constant and its comment; no `v2/` behaviour, signature or
+>   field changes. Recorded here, at the constant, and in
+>   `IMPLEMENTATION_PLAN.md`'s governing-constraint table.
+> - **Gate B (step 6) is CLOSED.** Coverage re-run on the post-Stage-2 corpus:
+>   797 symbols, 673 crypto perpetuals, 124 excluded by the universe rule,
+>   promotion rate 0.951515, 15 shakedown candidates. Window verdicts
+>   **2021-01-01 FAIL** (ICPUSDT 0.9855 < 0.995), **2022-01-01 FAIL** (LUNAUSDT
+>   0.9622 < 0.995), **2023-01-01 PASS** (gap ratio 0.0000, union min
+>   completeness 0.9993). Both failures are single-symbol completeness inside
+>   those windows only; `h<min rank` is 0 everywhere, so no window fails on
+>   ranking depth. Caveat on record: `analyze_coverage` measures **one**
+>   timeframe (`timeframe="1h"`), so the 2023 verdict was re-earned on 1h alone —
+>   the 1d/5m sufficiency evidence is Gate A's (`corpus verify` PASS, TA.3 warmup
+>   pre-flight, TA.4 1h invariant), not this report's.
+>
+>   | Identity | Value |
+>   |---|---|
+>   | `corpus_id` | `bab63c63e2e4f2c4` |
+>   | `data_snapshot_id` | `c8542cb360d13207` |
+>   | **`universe_id` — Stage 1** | **`7fd26361c467d048`** |
+>   | **`universe_id` — Stage 2** | **`7fd26361c467d048`** |
+>
+>   **TB.2 — the two values are identical.** Stage 2 changed no classified
+>   metadata, so C-6.9's hash did not move.
+>
+>   **Reconstruction method (TB.3).** `universe_id` is a pure function of the
+>   symbol set, the classification table and the snapshot union, so Stage 1 was
+>   recomputed by restricting `backtest.universe._SNAPSHOT_GLOBS` **in memory**
+>   to the captures committed before Gate A — 2026-07-31T20:42:02Z,
+>   2026-08-01T07:35:31Z, 2026-08-01T10:44:48Z and
+>   `reference/instruments/exchangeInfo-e4d300ae7348e1fc.json`
+>   (2026-07-31T20:40:29Z) — excluding Gate A's single capture,
+>   2026-08-02T16:34:56Z. Dated from each artifact's `.meta.json`
+>   `downloaded_at`. No file was created, moved or modified. The method is
+>   self-validating: the unrestricted arm reproduces the reported
+>   `7fd26361c467d048` exactly.
+>
+>   **Conclusion: `added=0, removed=0, changed=0`** over the 797 `resolved`
+>   entries — and the same at the layer below, where the raw snapshot union is
+>   851 instruments in both arms with 0 added / 0 removed / 0 changed. All five
+>   committed snapshots hold the identical 851 instruments and triples, so Gate
+>   A's capture contributed nothing. Source split **766 snapshot / 31 table** in
+>   both arms, with the table-sourced *set itself* identical; `table_version` 1,
+>   `universe_table_sha256` `1cc9fae9…b474` and `universe_definition_version` 1
+>   unchanged. `eligible_symbols` is **673** in both arms and the two frozen sets
+>   are equal, so the ranked candidate set replay will build is provably the one
+>   Stage 1 defined.
+>
+>   **TB.4 — PASS, stronger than the clause requires.** It permits *additions
+>   only*; the actual delta is zero of every kind. A removal is not
+>   representable: `read_snapshots` accumulates
+>   `seen.setdefault(symbol, set()).add(triple)` across all globs and reads every
+>   snapshot rather than the newest, so nothing unsets an earlier entry. An
+>   attribute mutation cannot pass silently: two differing triples for one symbol
+>   land in the same set and raise `SnapshotDisagreement`.
+>
+>   **TB.5 — signed off** by the user on 2026-08-03, on the verified empty diff
+>   above. No delta was presented for review because none exists.
+> - **Replay harness flags (step 9 provenance source).** `--caching` on
+>   `backtest.cli replay` enables the C-8.4 cache — **default off**. The swing
+>   implementation is not run configuration: it is the state of
+>   `analysis.structure.SWING_IMPL`, **default `"vectorized"`**. Both are written
+>   to the manifest's `optimizations` block by `backtest.lineage.optimizations`
+>   and are **excluded from `core()`**, so neither changes `run_id` and a
+>   comparison of two arms must use different `--out` roots. Measured 50.1 s →
+>   27.7 s (1.81x) on the pilot with all 9 bundle files identical.
+> - **Step 5 acceptance is closed.** All three T5.1b components have now run:
+>   (i) 80,412 windows / 321,648 comparisons, (ii) 24,359 windows / 97,436
+>   comparisons, (iii) 26,605 derived frames / 159,630 comparisons — **0
+>   mismatches** anywhere, on top of T5.1a's 7,970 comparisons over 13,987,235
+>   rows. Component (ii) departs from the plan's literal rule in two places, both
+>   forced by the corpus and both reported per symbol: three shakedown symbols
+>   hold 66-205 rows so no 499-row window fits, and six have no gap to centre on.
+>   No implementation change was required, so the T5.2 byte-identity result
+>   stands unre-run — the production diff is unchanged from the state it measured.
+> - **Step 5 (vectorized `identify_swings`) is landed.** `v2/analysis/structure.py`
+>   only — the single `v2/` edit C-16.3.1 authorizes. **99-120x** on the kernel,
+>   **4.18x** on replay; with Step 4, **7.22x** combined, byte-identical on both.
+>   Rollback is the module constant `SWING_IMPL = "v1"`, which restores the
+>   original loop retained permanently as `_swings_v1`. Implemented **pandas-only**
+>   so `tests/analysis/test_analysis_purity.py`'s numpy prohibition stays intact;
+>   a numpy version measured 911-1145x but Amdahl caps the replay gain at 6.35x
+>   either way, so the guard was not widened.
+> - **Step 4 (`CachingAnalyzer`) is landed.** C-8.4 memoization of the duplicate
+>   analysis at [orchestrator.py:265-268](v2/app/orchestrator.py#L265), enabled by
+>   `ReplayConfig(caching_analyzer=True)` — **default off**. Measured **1.91x** on a
+>   169-cycle `corpus-pilot` replay with all 9 bundle files byte-identical.
+>   Excluded from `core()`, so both arms share a `run_id` and a comparison must
+>   use different `output_root`s. The key is stricter than C-8.4's original text
+>   (it adds the `data_snapshot_id`/D1/M5/`live_price` components) — **the C-8.4
+>   amendment recording that is applied**: the stricter key is now the clause's
+>   required key, and the original three-component key is marked unsafe because
+>   T4.1 proved it collides across an H1 gap and returns a wrong Signal.
 > - **Performance roadmap:** `IMPLEMENTATION_PLAN.md`. **All six acquisition
 >   merges are landed** — 0 (environment pinning), 1 (pooled HTTP), 2
 >   (`Retry-After` / 418 / 429), 2b (`StorageTransient`), 3a (deterministic
 >   `DownloadReport`), 3b (parallel downloader) — **plus the S11 interrupt bug
->   fix**. Next is **Gate A: Stage 2 acquisition** — `1d` from 2022-01-01 and
->   `5m` from 2022-12-01, with the TA.3 warmup pre-flight. Steps 4
->   (`CachingAnalyzer`) and 5 (vectorized `identify_swings`) may be developed in
->   parallel with Gate A.
+>   fix**. Gate A (Stage 2 acquisition), steps 4 and 5, and Gate B (step 6) are
+>   all complete. Next is **step 7, Shakedown A**.
 > - **Gate A is two commands, not one.** `CorpusSpec` carries a single `start`
 >   for all timeframes, so the plan's per-timeframe lead-ins cannot be expressed
 >   in one invocation. Pass A (`--timeframes 1d --start 2022-01-01`) then Pass B

@@ -95,6 +95,18 @@ class ReplayConfig:
     #: differ only in `universe_id` produce the same `run_id` and therefore the
     #: same output directory. Adding it to `core` requires a C-16.2 amendment.
     universe_id: str = ""
+    #: C-8.4: memoize the analysis pipeline, removing the duplicate evaluation at
+    #: [orchestrator.py:265-268](v2/app/orchestrator.py#L265). Measured ~2x.
+    #:
+    #: **Deliberately absent from `core()`**, exactly as `universe_id` is, and for
+    #: the stronger reason: the whole claim being made is that memoization cannot
+    #: change a result. Putting it in `core` would assert the opposite — that two
+    #: runs differing only in this flag are not comparable — and C-16.2's `core`
+    #: is a closed list this module may not extend. The consequence is the same
+    #: one `universe_id` carries and is recorded rather than hidden: the two arms
+    #: share a `run_id` and therefore an output directory, so a cached-vs-uncached
+    #: comparison must direct them at different `output_root`s.
+    caching_analyzer: bool = False
 
     def __post_init__(self) -> None:
         if self.start % H1_SECONDS != 0:

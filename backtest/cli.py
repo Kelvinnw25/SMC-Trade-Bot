@@ -8,6 +8,7 @@ REPLAY_CONTRACT.md §10 ("cli.py — entry points"), §11. Milestone M11.
     python -m backtest reference funding  --root DATA --symbols BTCUSDT --start ... --end ...
     python -m backtest replay          --corpus DATA --out RUNS --start ... --end ...
     python -m backtest outcome         --corpus DATA --run RUNS/runs/<run_id>
+    python -m backtest audit           --run RUNS/runs/<run_id>
     python -m backtest metrics         --run RUNS/runs/<run_id>
     python -m backtest freeze          --run ... --out baselines/v2.0 --label ...
     python -m backtest splits          --start ... --end ... --train 4000 --test 2000
@@ -326,6 +327,10 @@ def _replay(args: argparse.Namespace) -> int:
         static_universe=tuple(args.static) if args.static else None,
         eligible=resolution.eligible_symbols,
         universe_id=resolution.universe_id,
+        # C-8.4. Absent from `core()`, so enabling it does not change `run_id`
+        # or the output directory — which is exactly why a cached-vs-uncached
+        # comparison must point the two arms at different `--out` roots.
+        caching_analyzer=args.caching_analyzer,
     )
     progress, log = _observability(args, args.out, "replay",
                                    unit="cycles", rate_name=" replay-h/s")
@@ -382,6 +387,8 @@ def _replay(args: argparse.Namespace) -> int:
 
 def _replay_config(driver, config) -> dict:
     """What a forensic reader needs to reconstruct a failed run exactly."""
+    from backtest.lineage import optimizations
+
     return {"run_id": driver.run_id, "run_dir": str(driver.run_dir),
             "data_snapshot_id": driver.data_snapshot_id,
             "universe_id": config.universe_id,
@@ -390,7 +397,12 @@ def _replay_config(driver, config) -> dict:
             "burn_in_h1": config.burn_in_h1,
             "top_coins_limit": config.top_coins_limit,
             "universe_mode": config.universe_mode,
-            "static_universe": list(config.static_universe or ())}
+            "static_universe": list(config.static_universe or ()),
+            # `run_id` does not distinguish the two arms — neither flag is in
+            # `core()` — so a crashed run's record must name them itself or the
+            # forensic reader cannot tell which configuration produced it.
+            "optimizations": optimizations(
+                caching_analyzer=config.caching_analyzer)}
 
 
 def _outcome(args: argparse.Namespace) -> int:
@@ -430,6 +442,29 @@ def _metrics(args: argparse.Namespace) -> int:
            "join_rate": dataset.join_rate,
            "written_to": str(out)})
     return 0
+
+
+def _audit(args: argparse.Namespace) -> int:
+    """Verify a finished run bundle against itself and against the contract.
+
+    Reads only; writes nothing into the run directory unless `--out` names a
+    destination. Exit 1 on any error finding — warnings do not fail an audit.
+    """
+    from backtest.audit import audit_run
+
+    report = audit_run(args.run)
+    payload = report.to_dict()
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                       encoding="utf-8")
+        payload["written_to"] = str(out)
+    _emit(payload)
+    _say(f"{payload['result']}: {payload['errors']} error(s), "
+         f"{payload['warnings']} warning(s) over {payload['checks_run']} "
+         f"check group(s)")
+    return 0 if report.ok else 1
 
 
 def _freeze(args: argparse.Namespace) -> int:
@@ -648,6 +683,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="classification table supplying the exchangeInfo metadata of "
              "instruments delisted before snapshot capture began; defaults to "
              "reference/universe_table.json")
+    replay.add_argument(
+        "--caching", action="store_true", dest="caching_analyzer",
+        help="memoize the analysis pipeline (C-8.4), removing the duplicate "
+             "evaluation in the orchestrator. Off by default: the flag changes "
+             "wall time only, and a run must opt into it explicitly so the "
+             "manifest's provenance block records a deliberate choice")
     replay.add_argument("--validate-only", action="store_true",
                         dest="validate_only")
     _add_observability_flags(replay)
@@ -671,6 +712,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace an existing report; a re-derivation replaces its "
              "predecessor deliberately, never silently")
     metrics.set_defaults(func=_metrics)
+
+    # -- audit -----------------------------------------------------------
+    audit = sub.add_parser(
+        "audit", help="verify a finished run bundle's integrity")
+    audit.add_argument("--run", required=True, type=Path,
+                       help="a run directory: <out>/runs/<run_id>")
+    audit.add_argument("--out", type=Path, default=None,
+                       help="write the report here as JSON; without it the "
+                            "report goes to stdout only and the run directory "
+                            "is not touched")
+    audit.set_defaults(func=_audit)
 
     frozen = sub.add_parser("freeze", help="freeze a run's report as a baseline")
     frozen.add_argument("--run", required=True, type=Path)

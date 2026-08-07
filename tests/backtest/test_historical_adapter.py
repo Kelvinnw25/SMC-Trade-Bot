@@ -656,6 +656,119 @@ class TestUniverse(RepositoryCase):
 
 
 # ==========================================================================
+# Finding A1 — a delisted instrument must not rank on frozen volume
+# ==========================================================================
+
+class TestStaleSymbolsAreNotRanked(RepositoryCase):
+    """`window` is row-based (C-6.3), so before the fix a dead symbol kept
+    returning its final 24 candles at every later `T` and ranked on them
+    forever. Ranking now also requires the newest of those rows to open inside
+    the trailing day.
+
+    Every fixture below gives the stale symbol a *higher* qv than the live one,
+    so each test is its own control: without the recency test the stale symbol
+    would rank first, not be absent.
+    """
+
+    def test_a_delisted_symbol_does_not_rank(self):
+        adapter = self.positioned({
+            ("LIVEUSDT", "1h"): h1_series(48, qv=1.0),
+            ("DEADUSDT", "1h"): h1_series(
+                48, qv=999_999.0, end_open_ms=T0_MS - 5_000 * HOUR_MS),
+        })
+        self.assertEqual([e.symbol for e in adapter.get_top_volume_symbols(10)],
+                         ["LIVE/USDT"])
+
+    def test_a_symbol_trading_at_T_is_unaffected(self):
+        """The regression half: surviving symbols keep their exact volume."""
+        rows = h1_series(48, qv=1000.0)
+        adapter = self.positioned({("LIVEUSDT", "1h"): rows})
+        expected = sum(row[7] for row in rows[-25:-1])   # 24 closed, not 25
+        entries = adapter.get_top_volume_symbols(10)
+        self.assertEqual([e.symbol for e in entries], ["LIVE/USDT"])
+        self.assertEqual(entries[0].volume, expected)
+
+    def test_a_symbol_alive_at_T_but_delisted_later_still_participates(self):
+        """The look-ahead half. Positioned inside the symbol's life it ranks
+        normally; nothing about its later death is visible at `T`."""
+        death = T0_MS - 100 * HOUR_MS
+        datasets = {
+            ("LIVEUSDT", "1h"): h1_series(4_000, qv=1.0),
+            ("DOOMEDUSDT", "1h"): h1_series(4_000, qv=500.0, end_open_ms=death),
+        }
+        alive = self.positioned(datasets, name="alive",
+                                boundary=(death // 1000) - 3600)
+        self.assertIn("DOOMED/USDT",
+                      [e.symbol for e in alive.get_top_volume_symbols(10)])
+        after = self.positioned(datasets, name="after")
+        self.assertNotIn("DOOMED/USDT",
+                         [e.symbol for e in after.get_top_volume_symbols(10)])
+
+    def test_the_newest_row_may_open_exactly_at_the_trailing_boundary(self):
+        adapter = self.positioned({("EDGEUSDT", "1h"): h1_series(
+            48, qv=5.0, end_open_ms=T0_MS - 24 * HOUR_MS)})
+        self.assertEqual([e.symbol for e in adapter.get_top_volume_symbols(10)],
+                         ["EDGE/USDT"])
+
+    def test_one_hour_older_than_the_trailing_boundary_is_excluded(self):
+        adapter = self.positioned({("EDGEUSDT", "1h"): h1_series(
+            48, qv=5.0, end_open_ms=T0_MS - 25 * HOUR_MS)})
+        self.assertEqual(adapter.get_top_volume_symbols(10), ())
+
+    def test_a_gap_longer_than_a_day_suspends_ranking_until_data_resumes(self):
+        """Stated rather than left implicit: staleness is staleness. A symbol
+        with no candle in the trailing day has no trailing-day volume, whatever
+        the reason, and live's ticker would report ~0 for it rather than a sum
+        from before the outage."""
+        adapter = self.positioned({("GAPUSDT", "1h"): h1_series(
+            48, qv=5.0, end_open_ms=T0_MS - 30 * HOUR_MS)})
+        self.assertEqual(adapter.get_top_volume_symbols(10), ())
+
+    def test_the_test_reads_no_row_after_T(self):
+        """Rows after `T` cannot influence the result — the same universe comes
+        back whether or not the future exists in the repository."""
+        past = h1_series(48, qv=7.0)
+        future = h1_series(148, qv=7.0, end_open_ms=T0_MS + 100 * HOUR_MS)
+        self.assertEqual(
+            self.positioned({("AAAUSDT", "1h"): past}, name="p")
+                .get_top_volume_symbols(10),
+            self.positioned({("AAAUSDT", "1h"): future}, name="f")
+                .get_top_volume_symbols(10))
+
+
+@unittest.skipUnless((Path("data/stage1") / "canonical").is_dir(),
+                     "requires the Stage 2 corpus at data/stage1")
+class TestStaleSymbolsOnTheRealCorpus(unittest.TestCase):
+    """The three instruments finding A1 named, at the shakedown's own `T_0`."""
+
+    #: 2023-01-01T00:00:00Z — the coverage-validated replay start.
+    T_0 = 1_672_531_200
+    DEAD = ("LUNAUSDT", "ANCUSDT", "KEEPUSDT")
+
+    def setUp(self) -> None:
+        self.adapter = HistoricalMarketDataAdapter(
+            KlineRepository(Path("data/stage1") / "canonical"))
+
+    def test_none_of_the_delisted_symbols_rank_at_T0(self):
+        self.adapter.set_time(self.T_0)
+        ranked = {e.symbol for e in self.adapter.get_top_volume_symbols(30)}
+        for native in self.DEAD:
+            self.assertNotIn(f"{native[:-4]}/USDT", ranked, native)
+
+    def test_the_universe_is_still_full(self):
+        """The slots the dead symbols held go to live instruments, not nowhere."""
+        self.adapter.set_time(self.T_0)
+        self.assertEqual(30, len(self.adapter.get_top_volume_symbols(30)))
+
+    def test_luna_ranked_while_it_was_still_trading(self):
+        """Its exclusion is recency, not a blanket ban: at a boundary inside
+        LUNA's life it ranks normally."""
+        self.adapter.set_time(1_650_000_000 // 3600 * 3600)   # 2022-04-15
+        ranked = {e.symbol for e in self.adapter.get_top_volume_symbols(30)}
+        self.assertIn("LUNA/USDT", ranked)
+
+
+# ==========================================================================
 # Positioning, determinism, failure modes, lineage
 # ==========================================================================
 

@@ -59,7 +59,7 @@ replay-based acceptance tests are redirected to `corpus-pilot`.
 
 | Constraint | Source | Consequence |
 |---|---|---|
-| `v2/` production edits are authorized **only** for the M1 lineage set and the C-8.5 performance work | C-16.3.1 | Step 5 is the **only** step that may touch `v2/`. Steps 0-4 are `backtest/`, `tests/` and repo-root files only. |
+| `v2/` production edits are authorized **only** for the M1 lineage set and the C-8.5 performance work | C-16.3.1 | Step 5 is the **only** step that may touch `v2/`. Steps 0-4 are `backtest/`, `tests/` and repo-root files only. **One approved exception (2026-08-03):** finding A1's `STRATEGY_VERSION` 2.1.0 → 2.2.0 bump in [ledger.py](v2/app/ledger.py). Required because `core()` carries no harness version, so without it two runs either side of the A1 fix would share a `run_id` (C-5.7.2). Scope is that constant and its comment — no `v2/` behaviour, signature or field changes. |
 | `atr_mean` MUST use `df["atr"].dropna().mean()` (pandas' summation order) | C-8.5 | [structure.py:90-96](v2/analysis/structure.py#L90) is frozen text. Enforced by T5.4. |
 | Vectorization permitted only behind a golden-master test proving bit-identical Signals | C-8.5 | Step 5 gate is T5.1a + T5.1b + T5.2. Our bar (bit-identical *swings*) is stricter. |
 | Symbol order MUST NOT be re-sorted, shuffled, parallelized or deduplicated | C-5.6.2 | No step parallelizes replay. Prohibition, not a risk assessment. |
@@ -68,7 +68,7 @@ replay-based acceptance tests are redirected to `corpus-pilot`.
 | Warmup is a **report**, not a gate — enforced per symbol by the D1<10 / H1<50 guards | [driver.py:124-133](backtest/replay/driver.py#L124) | An under-warmed corpus does **not** fail. Gate A must validate warmup explicitly. See F1 below. |
 | No resume in Version 1; acceptable **because** Shakedowns A and B establish crash probability first | PHASE0 §6 | **CODE FREEZE after step 5.** No merge between Shakedown A and the official replay. |
 | Baseline MUST be a single unsharded run | C-5.7 item 4, R-14 | Step 9 is serial. Sharding is exploration-only. |
-| Frozen docs are never edited; amendments are proposed patches awaiting approval | project rule | The C-8.4 amendment (step 4) blocks that merge, not this plan. |
+| Frozen docs are never edited; amendments are proposed patches awaiting approval | project rule | The C-8.4 amendment (step 4) blocked that merge, not this plan. **Approved and applied 2026-08-06**, together with the C-16.2 patch — see the closed gate items below. |
 
 ---
 
@@ -755,12 +755,23 @@ establish a low crash probability first. The two decisions are coupled."*
 change invalidates the evidence the no-resume decision rests on. If a defect is found
 after Shakedown A, the shakedowns are re-run from A — they are not patched around.
 
-**Gate items owned by the user, to be closed before step 9:**
-- `T_n` decision: 2026-06-28 (all trades resolve) vs 2026-07-05 (`OPEN` tail)
-- `universe_id` vs C-16.2 `core` — frozen-doc patch, still pending
-- C-8.4 amendment (step 4) — approved
-- `PHASE0_FREEZE.md` entries for the classification table, the selected replay window
-  and its evidence, and the optimization provenance block
+**Gate items owned by the user — ALL CLOSED 2026-08-06:**
+- ✅ `T_n` decision: **2026-06-28T23:00:00Z** (1782687600), chosen because all
+  trades resolve — it sits exactly 168 h (`OutcomeConfig.max_holding_h1`) before
+  the corpus's last boundary, so there is no `OPEN` tail to censor. 30,600
+  boundaries. Recorded in `PHASE0_FREEZE.md` §9.
+- ✅ `universe_id` vs C-16.2 `core` — patch **applied**. `static_universe` is named
+  in `core` to match the implementation; `universe_id` and the two `optimizations`
+  flags are documented as recorded *outside* it, with the shared-`run_id`
+  consequence stated and Gate B's stability result as the mitigation.
+- ✅ C-8.4 amendment (step 4) — **applied**. The original three-component key is
+  marked unsafe (T4.1 proves it collides across an H1 gap); the implemented
+  ten-component determinant is now the required key.
+- ✅ `PHASE0_FREEZE.md` — version history gains **2.2.0** (the A1 stale-ranking
+  fix, final frozen strategy state); new §9 records the selected window with its
+  PASS/FAIL evidence, the frozen identities, the optimization provenance block
+  (`caching_analyzer = true`, `vectorized_swings = true`) and the shakedown
+  evidence the no-resume decision rests on.
 
 ---
 

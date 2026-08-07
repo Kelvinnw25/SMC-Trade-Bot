@@ -1185,6 +1185,306 @@ classes.
   universe and canonical datasets. Two files touched.
 - **Status:** ✅ Complete. Gate A has no remaining technical blocker.
 
+### S12 — Performance roadmap, Step 4: the duplicate analysis is paid once
+
+[orchestrator.py:265-268](v2/app/orchestrator.py#L265) evaluates the full analysis
+chain **twice** per symbol-scan — once for the observability/kill context, once
+inside `analyze`. C-8.4 permits memoizing it. Nothing in `v2/` changed.
+
+- **Where the memo sits.** On the *pipeline*, not on `analyze`. The orchestrator
+  calls both seams, so memoizing `analyze` alone would leave the first evaluation
+  unpaid; wrapping `AnalysisPipeline` puts the memo underneath both. It also keeps
+  V1's M5 re-score gate (`score >= 8`) in `v2/`, executed every call — caching
+  `analyze` directly would have required reimplementing that gate in `backtest/`.
+- **The key is stricter than C-8.4's text**, deliberately. C-8.4 specifies
+  `(symbol, h1_last_ts, session_active)`, which under-determines the snapshot:
+  during an H1 gap `h1_last_ts` freezes while D1, M5 and `live_price` advance.
+  Implemented key: `(data_snapshot_id, symbol, h1_last_ts, len(h1), d1_last_ts,
+  len(d1), m5_last_ts, len(m5), bit-pattern of live_price, session_active)`.
+  `live_price` enters as its `struct.pack` bit pattern so `0.0`/`-0.0` stay
+  distinct and NaN compares equal to itself.
+- **The failure mode is demonstrated, not asserted.** `DYDX/USDT` at
+  2023-03-15T12:00Z across a constructed H1 gap: cycle 0 scores 13/VALID/
+  `m5_choch=True`, cycles 1-2 score 11/WATCH/`m5_choch=False`. A C-8.4-keyed cache
+  serves cycle 0's VALID to both later cycles. The test asserts that wrong Signal
+  is actually produced.
+- **The fixture is corpus-derived, not synthetic** — a documented deviation.
+  IMPLEMENTATION_PLAN §5 specified synthetic data on the premise that *"the gapped
+  symbols live in `data/stage1`, which has no M5."* **Gate A removed that premise.**
+  It mattered: hand-built OHLC scored 0/SKIP on all three cycles, never reaching
+  the `score >= 8` gate, which would have made the equality assertions pass
+  vacuously against a broken cache — the exact outcome §5 exists to prevent.
+- **`core()` is untouched.** `caching_analyzer` is excluded exactly as
+  `universe_id` is, because the claim is that it cannot change a result. Verified:
+  `core()` is byte-identical and `run_id` unchanged with the flag on and off. The
+  consequence is recorded rather than hidden — both arms share a `run_id` and
+  therefore an output directory, so a comparison must use different `output_root`s.
+- **T4.3 byte-identity** on `data/corpus-pilot` (2024-06-01 → 2024-06-08,
+  `burn_in_h1=0`, 169 cycles, 845 ledger rows, 37 alerts): **all 9 bundle files
+  byte-identical**, `core` identical, `run_id` identical. **1.91x** (194.8 s →
+  102.0 s).
+- **Negative controls.** A symbol-only key yields a 27.40x false speedup and
+  breaks 6 of 9 files plus loses `alerts.jsonl` entirely — T4.3 fails as required.
+  A cache cleared between calls still passes every equality test, which is why
+  T4.6 asserts the hit rate: equality alone cannot detect a dead cache.
+- **Measured hit rate:** exactly 1 hit + 1 miss per symbol-scan (50%), ≥1 hit for
+  every symbol. A hit returns the *identical* frozen `AnalysisContext` object.
+- **Bounded.** 128 entries, LRU. Entries retain their `AnalysisContext` and hence
+  the snapshot's DataFrames; unbounded over a 30,000-cycle replay would retain
+  every frame the run ever built. One entry would suffice — the two calls are
+  adjacent — so the bound costs nothing.
+- **Verification:** 30 new tests; full suite **1,950 tests, 1 failure** (the known
+  session-hours flake); 245 replay/orchestrator tests green with the cache
+  **forced ON** regardless of config.
+- **What did NOT change:** every file under `v2/`, the analysis stages and their
+  order, the M5 gate, lifecycle semantics, the adapter, capture, sinks, the
+  corpus, acquisition. `identify_swings` is untouched — Step 5 is not begun.
+- **Status:** ✅ Step 4 complete.
+
+### S13 — Performance roadmap, Step 5: `identify_swings` vectorized
+
+The dominant replay cost, measured at **84.3% of one pipeline evaluation**
+(2717.9 ms of 3226.0 ms across 3.13 calls per symbol). C-8.5 authorizes exactly
+this function; this is the one step permitted to touch `v2/` (C-16.3.1).
+
+- **Only the selection is vectorized.** The nested `for i / for j` neighbour scan
+  and the prominence filter become column-wise operations. The consecutive-equal
+  suppression stays a sequential loop — it reads back the element it just
+  appended — but now iterates the surviving candidates instead of every row.
+- **The C-8.5 prologue is untouched and unmoved.** `atr_mean = float(df["atr"].
+  dropna().mean())` stays inside `identify_swings`, above the dispatch, and both
+  implementations receive the `min_prominence` it produces. T5.4 asserts the
+  source text and that the prologue precedes the dispatch.
+- **The V1 loop stays in the tree permanently** as `_swings_v1`, reachable via
+  `SWING_IMPL = "v1"`. That constant is the entire rollback.
+- **Pandas-only, deliberately.** `tests/analysis/test_analysis_purity.py` forbids
+  numpy in `v2/analysis` and states that extending the allowlist is *"a
+  deliberate, reviewable architectural decision — not a routine fix."* A numpy
+  implementation measured **911-1145x** on the kernel; the pandas one measures
+  **99-120x**. The difference is worth nothing at replay level: at 100x the kernel
+  is already ~1% of pipeline time and Amdahl caps the pipeline gain at **6.35x**
+  either way (6.29x vs 6.34x). The guard was left intact.
+- **The three hazards, each with its mandated primitive.** (1) `Series.min()`
+  skips NaN — reproduced with `DataFrame.min(axis=1)`, whose `skipna` semantics
+  are identical including all-NaN → NaN. (2) Python's `max(a, b)` is
+  `b if b > a else a`, asymmetric on NaN — written as `left.mask(right > left,
+  right)`, never an elementwise maximum, which would propagate NaN both ways.
+  (3) `n <= 2 * window` is the first statement, where the shifted form would
+  otherwise produce a zero-length operand.
+- **Comparison method.** Never `assertEqual` — it passes on a type change
+  (`5 == 5.0`) and fails on NaN. Every comparison checks list length, `index`
+  type and value, `price` type, and the price's **bit pattern** via
+  `np.float64(...).tobytes()`.
+- **T5.2 byte-identity** on `data/corpus-pilot` (169 cycles, 845 ledger rows,
+  37 alerts): **all 9 bundle files identical**, `run_id` unchanged, **4.18x**
+  (197.3 s → 47.2 s). **Steps 4+5 combined: 7.22x** (197.3 s → 27.3 s), also
+  byte-identical.
+- **T5.1a PASS** — all 797 Stage 1 datasets × 5 parameter sets over 13,987,235
+  rows: **7,970 comparisons, 0 mismatches**, 24.4 min across 12 cores. V1 cost
+  measured at 112.6 µs/row against the plan's 114.4 µs, confirming its 2.2 h
+  serial budget; the sweep is parallel per dataset, which changes wall time only.
+- **T5.1b(i) PASS** — strided windows, 499 rows at stride
+  `max(1, (n-499)//100)` per dataset, both H1 parameter sets: **80,412 windows,
+  321,648 comparisons, 0 mismatches**, 31.7 min.
+- **T5.1b(ii) PASS** — stride-1 dense segments over the 15 shakedown symbols:
+  **24,359 windows, 97,436 comparisons, 0 mismatches**, 15.9 min. Two deviations
+  from the plan's literal selection rule, both forced by the corpus and both
+  asserted per symbol rather than left implicit: CAPUSDT/GRAMUSDT/DATAIPUSDT hold
+  66-205 rows so **no** 499-row window fits — substituted with every frame the
+  walker can actually present, `rows[max(0, k-499):k]`; and six symbols have
+  `gap_count == 0`, so the 2,000-window block is taken from the series start
+  because there is no gap to centre on.
+- **T5.1b(iii) PASS** — derived frames from `data/corpus-pilot`, stride 10 over
+  1,093 boundaries × 5 symbols = **5,345 cycle-symbols**, three parameter sets:
+  **26,605 frames, 159,630 comparisons, 0 mismatches**, 9.3 min. The frames are
+  not reconstructed — the real adapter and analyzer run, with `identify_swings`
+  wrapped at its three call sites, so what is compared is the exact object
+  production passes: the H4 resample (**no `atr` column** — the `atr_mean = 0.0`
+  branch, 5,345 frames), the EMA-augmented D1 (5,225 — the remaining 120 fall
+  under `_derive_simple_bias`'s own `len < 20` early return) and H1 (5,345), the
+  raw H1 (5,345), and the 199-row M5 (5,345).
+- **Randomised differential**, always on: 2,000 deterministic pseudo-random
+  frames including NaN injection, forced ties, absent `atr` columns and
+  `n <= 2*window`, across all five parameter sets.
+- **What did NOT change:** the signature and return contract, `to_swings`, the
+  consecutive-equal suppression, the `atr_mean` accumulation, every call site
+  (`htf.py`, `scoring.py`, `structure.py`), and every file outside
+  `v2/analysis/structure.py` and its tests.
+- **Status:** ✅ Step 5 complete.
+
+### S14 — Replay harness: the optimizations are reachable and recorded
+
+Two defects found reviewing Gate B, both of which would have surfaced only at
+step 9 — **after** the code freeze had closed the window to fix them. Neither is
+replay, analysis or strategy logic; both are wiring and provenance.
+
+- **B1 — the CLI could not enable the Step 4 cache.** `cli._replay` built
+  `ReplayConfig` without `caching_analyzer` and no flag existed to set it, so
+  *every* CLI replay — both shakedowns and the official baseline — ran with the
+  cache off, while step 9 requires the manifest to record it on. Worse, the
+  6-12 h projection was derived from the combined **7.22x**; with caching off
+  only Step 5's 4.18x applies, which would also have measured Shakedown A's
+  "wall-clock rate consistent with the step 4+5 projection" against the wrong
+  baseline. Fixed with `--caching`, **default off**, so nothing changes unless a
+  run opts in.
+- **B2 — the manifest never recorded which swing implementation ran.** Step 9 §4
+  names `vectorized_swings` beside `caching_analyzer`; the block held only the
+  latter. Without it a rolled-back baseline (`SWING_IMPL = "v1"`) is
+  indistinguishable from a vectorized one in its own manifest, and `git_commit`
+  does not close the gap — it reads `.git/HEAD` and carries no dirty-tree flag.
+- **The architectural constraint that shaped the fix.**
+  `test_the_driver_contains_no_strategy_logic` holds `backtest/replay/` to a
+  closed set of `v2` imports. Widening it to write one boolean would trade an
+  architectural guarantee for a convenience, so the block is assembled by
+  `backtest.lineage` — already the provenance layer, already re-exporting
+  `STRATEGY_VERSION` from `v2.app.ledger`. A test asserts the driver package
+  still never imports `v2.analysis.structure`.
+- **`SWING_IMPL` is read live, not bound at import time**, so the manifest
+  records the value the run actually used rather than the value the module held
+  when `backtest.lineage` was first imported — which after a rollback is exactly
+  the wrong one.
+- **Byte-identity, through the real CLI** on `data/corpus-pilot`
+  (2024-06-01 → 2024-06-08, 169 cycles, 845 ledger rows, 37 alerts): **all 9
+  bundle files identical**, `run_id` **replay-564789ce2f0d56e5** in both arms,
+  manifest identical once `generated_at`, `wall_seconds` and `optimizations` are
+  excluded — the last being the variable under test. **50.1 s → 27.7 s (1.81x).**
+- **Negative controls**, both verified to diverge: deleting
+  `caching_analyzer=args.caching_analyzer` fails the CLI wiring test and nothing
+  else; dropping `vectorized_swings` fails the manifest test.
+- **What did NOT change:** replay logic, the analyzer, scoring, lifecycle, the
+  strategy, `core()`, `run_id`, the corpus, acquisition, and every file under
+  `v2/`.
+- **Status:** ✅ Shakedown A unblocked on the harness side.
+
+### S15 — Gate B closed: the universe did not move
+
+`universe_id` is C-6.9's evidence that Stage 2 changed no *classified metadata*.
+The plan anticipated a changed hash as the expected outcome — a new corpus root
+commits new discovery snapshots, and any instrument listed between the two
+discoveries enlarges `resolved`. It did not happen.
+
+- **Stage 1 and Stage 2 are the same hash, `7fd26361c467d048`.** Recovering the
+  Stage 1 value took a reconstruction: `data/` is gitignored and Gate B
+  overwrote `data/stage1/coverage.json` in place, so the only copy was gone.
+- **Method.** `universe_id` is a pure function of the symbol set, the
+  classification table and the snapshot union, so Stage 1 was recomputed by
+  restricting `_SNAPSHOT_GLOBS` **in memory** to the captures committed before
+  Gate A, excluding its single 2026-08-02T16:34:56Z capture. Nothing on disk was
+  touched. The unrestricted arm reproduces the reported hash exactly, which is
+  what makes the restricted arm trustworthy.
+- **`added=0, removed=0, changed=0`** over 797 `resolved` entries, and the same
+  at the layer below: the raw snapshot union is 851 instruments in both arms,
+  and all five committed snapshots carry the identical 851 instruments and
+  triples. Gate A's capture contributed nothing — Binance's declared perpetual
+  set did not move between 2026-08-01 10:44 and 2026-08-02 16:34.
+- **TB.4 holds more strongly than written.** It permits additions only; the
+  delta is zero of every kind. A removal is not representable —
+  `read_snapshots` accumulates into a set across *all* snapshots and never
+  unsets. An attribute mutation cannot pass silently — two triples for one
+  symbol raise `SnapshotDisagreement` rather than quietly changing the hash.
+- **The evidence-handling lesson, recorded rather than filed away.** Coverage
+  artifacts determine the window choice, which makes them scientific evidence
+  under PHASE0 §7 — immutable, not overwrite-in-place. Regenerating them into
+  the same path destroyed the TB.3 baseline and is the sole reason a
+  reconstruction was needed at all.
+- **Status:** ✅ Gate B closed. Steps 0-6 complete; step 7 (Shakedown A) is next.
+
+### S16 — Finding A1: delisted instruments no longer rank
+
+Shakedown A's own artifacts exposed it. 1,519 of 22,134 ledger rows (**6.9%**) were
+analysed against a reference candle **5,585-7,868 hours stale**: LUNAUSDT at all
+744 cycles holding **rank 1-5**, ANCUSDT at 633, KEEPUSDT at 142 — instruments
+that stopped trading in 2022 being ranked at 2023 boundaries.
+
+- **Root cause.** `KlineRepository.window` is C-6.3 verbatim and therefore
+  *row-based, never time-based*: it returns the last 24 **stored** rows at or
+  before `T`, however old. Correct for frames, where a gap must not be padded;
+  wrong for ranking, where it silently turns "no data at `T`" into "an arbitrary
+  sum from the past". A dead symbol kept returning a full 24 rows, passed the
+  eligibility test, and held a top-30 slot forever.
+- **Not an intentional bias.** The ranking docstring's stated purpose is to avoid
+  survivorship and look-ahead by ranking instruments *alive at `T`*; admitting
+  ones already dead at `T` is the inverse error. Live cannot do it — it ranks
+  from `/fapi/v1/ticker/24hr`, which lists only trading instruments — so the
+  divergence was undeclared, and C-5.5's `_DECLARED_BIASES` covered only the
+  ranking cadence and source.
+- **The fix is one predicate:** the newest of the 24 rows must open at or after
+  `T - 24h`. Causal by construction — it reads no row after `T` and consults no
+  property of the future — so a symbol alive at `T` and delisted later still
+  ranks normally at every boundary inside its life.
+- **Why "zero alerts" did not make it harmless.** All 1,519 stale rows decided
+  SKIP, so no false signal existed. But the defect was in the universe *input*:
+  LUNA held a top-3 slot at every cycle, so the effective live universe was 27-29
+  symbols, not 30, and the displaced symbols' signals are simply missing.
+  Measured over eight sampled boundaries, **every one changes**: the three dead
+  symbols leave and AVAX, AXS, CRV, DOT, DYDX, EOS, LUNA2, SAND and WAVES take
+  the freed slots — LUNA2USDT, the live successor token, replacing dead LUNAUSDT.
+- **`STRATEGY_VERSION` 2.1.0 → 2.2.0**, required rather than cosmetic:
+  `ReplayConfig.core()` is C-16.2's closed list and carries no harness version,
+  so without the bump two runs either side of the fix would share a `run_id` and
+  look comparable while differing (C-5.7.2). Recorded in the constant's history
+  as a change to the symbol set the strategy is *evaluated over* — the live path
+  is untouched.
+- **Consequence, per PHASE0 §6:** Shakedown A's evidence covered the pre-fix
+  code and no longer applies. It must be re-run before Shakedown B — the
+  shakedowns are re-run from A, not patched around. No baseline existed to
+  invalidate, and `corpus_id`, `data_snapshot_id` and `universe_id` are all
+  unaffected: this is a ranking rule, not corpus content or classification
+  metadata, so Gate A and Gate B stand.
+- **Status:** ✅ A1 fixed. Shakedown A must be re-run before step 8.
+
+### S17 — Pre-baseline freeze: the canonical run is specified
+
+Steps 0-8 are complete and the last documentation debt is paid. This entry is the
+record of *what will be measured*, written before the measurement — which is the
+whole point of a pre-registered baseline.
+
+- **Every gate passed.** Gate A (Stage 2 acquisition) · Step 4 (`CachingAnalyzer`,
+  1.91x, byte-identical) · Step 5 (vectorized swings, 586,684 bit-exact
+  comparisons, 0 mismatches) · Gate B (coverage re-run; `universe_id` unchanged
+  with `added=0 removed=0 changed=0`) · Shakedown A2 `replay-e6ff984d844e5ae4`
+  (744 cycles) · Shakedown B `replay-b56115479c642a43` (30,768 cycles, 13 pinned
+  pathology symbols). Both shakedowns: zero crashes, zero swallowed errors against
+  a budget of zero, every `universe_error` null, and exact lifecycle
+  reconstruction at every cycle.
+- **The window is frozen at `T_0 = 2023-01-01T00:00:00Z` → `T_n =
+  2026-06-28T23:00:00Z`** (30,600 boundaries). `T_n` is not a round number chosen
+  for tidiness: it sits **exactly 168 hours** — `OutcomeConfig.max_holding_h1` —
+  before the corpus's last boundary, so every signal instantiated at `T_n` has its
+  full maximum holding period of price history to resolve in. The alternative ended
+  at the data's edge and would have left an `OPEN` tail requiring censoring. The
+  cost of the cleaner reference is 168 boundaries out of 30,768.
+- **The C-8.4 amendment is applied.** The clause's original key,
+  `(symbol, h1_last_ts, session_active)`, is now marked **unsafe and MUST NOT be
+  used**: during an H1 gap `h1_last_ts` freezes while D1, M5 and `live_price`
+  advance, and the corpus holds 6,204 gap hours across 52 symbols, so it returns a
+  Signal built for another `T` in violation of I-8. The required key is the
+  ten-component determinant Step 4 implements, with `live_price` entering as an
+  IEEE bit pattern.
+- **The C-16.2 amendment is applied.** `static_universe` is named in `core` to
+  match the implementation, and the three keys recorded *outside* it —
+  `universe_id`, `caching_analyzer`, `vectorized_swings` — now carry their
+  reasoning and, for `universe_id`, the consequence stated plainly: two runs
+  differing only in it share a `run_id`. Gate B's stability result is what keeps
+  that from touching this baseline.
+- **`PHASE0_FREEZE.md` gains §9, the canonical baseline specification**: the
+  window with its PASS/FAIL evidence, the frozen identities (`corpus_id`
+  `bab63c63e2e4f2c4`, `data_snapshot_id` `c8542cb360d13207`, `universe_id`
+  `7fd26361c467d048`, `strategy_version` `2.2.0`), the optimization provenance
+  block, and the shakedown evidence the no-resume decision rests on. The version
+  history gains **2.2.0** — the A1 stale-ranking fix — recorded as the final
+  frozen strategy state.
+- **What was deliberately recorded as *not* covered**, so no one later mistakes
+  silence for coverage: Shakedown B exercised no gap-adjacent boundaries (every
+  gap in the pinned set predates `T_0`), and the three shortest-lifespan pathology
+  symbols produced no ledger rows because the D1≥10 guard skipped all 287 of their
+  appearances. The zero-volume/flat-candle dimension *was* exercised thoroughly —
+  92,304 rows, 100% SKIP, no alerts, which is the correct response to degenerate
+  data.
+- **Documentation only.** No production code, test, corpus or bundle changed.
+- **Status:** ✅ Steps 0-8 complete. Step 9 (Official Replay) is next, projected
+  at **7.7 h**.
+
 ## 12. Strategy Evolution Roadmap
 
 Evidence-driven. Each phase gates the next; no calibration before a backtester

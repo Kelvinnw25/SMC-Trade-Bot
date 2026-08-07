@@ -47,12 +47,35 @@ CONTRACT_VERSION = "1.1"
 #           that the name test admitted. This changes which symbols are scanned
 #           and therefore which signals exist, so it is a behaviour change, not
 #           a metadata fix. See PHASE0_FREEZE.md.
+#   2.2.0 — Finding A1: replay's C-6.9 universe reconstruction ranked delisted
+#           instruments on frozen volume, because `KlineRepository.window` is
+#           row-based (C-6.3) and kept returning a dead symbol's final 24 candles
+#           at every later `T`. `get_top_volume_symbols` now also requires the
+#           newest of those rows to open inside the trailing day. Like 2.1.0 this
+#           changes which symbols are scanned and therefore which signals exist.
+#           **The live path is unchanged** — live ranks from `/fapi/v1/ticker/24hr`
+#           and never saw a delisted instrument — so this bump records a change to
+#           the symbol set the strategy is *evaluated over*, not to the strategy.
+#           It is nonetheless required here: `ReplayConfig.core()` is C-16.2's
+#           closed list and carries no harness version, so without it two runs
+#           either side of the fix would share a `run_id` and look comparable
+#           while differing (C-5.7.2).
+#
+#           **Authorized exception to C-16.3.1.** That clause sanctions `v2/`
+#           production edits only for the M1 lineage set (its enumerated items
+#           1-4) and the C-8.5 performance work, and IMPLEMENTATION_PLAN's
+#           constraint table restates it as "Step 5 is the only step that may
+#           touch `v2/`". This bump is neither, so it is a deviation — approved by
+#           the user on 2026-08-03, recorded here, in that constraint table, and
+#           in PROJECT_STATE.md rather than passed silently. The scope of the
+#           exception is exactly this line and its history comment: no behaviour,
+#           signature or field in `v2/` changes with it.
 #
 # This is the single definition. `backtest/lineage.py` imports it rather than
 # declaring its own: it previously declared `"v2.0"` while ledger rows carried
 # `"2.0.1"`, so the run manifest and the rows inside it disagreed about which
 # code produced them.
-STRATEGY_VERSION = "2.1.0"
+STRATEGY_VERSION = "2.2.0"
 
 
 def assemble_ledger_record(
