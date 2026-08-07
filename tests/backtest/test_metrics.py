@@ -17,6 +17,7 @@ import json
 import math
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from backtest.dataset import (
@@ -24,7 +25,7 @@ from backtest.dataset import (
     read_outcomes,
 )
 from backtest.metrics import (
-    BOOTSTRAP_SEED, DIMENSIONS_BY_NAME, HEADLINE, METRICS_BY_NAME,
+    BOOTSTRAP_SEED, DIMENSIONS, DIMENSIONS_BY_NAME, HEADLINE, METRICS_BY_NAME,
     MIN_SEGMENT_N, N_RESAMPLES, BaselineError, ComparisonKey, Dimension,
     IncomparableBaseline, ReportInputs, bootstrap_mean, build_equity_curve,
     build_report, c98_order_key, catalogue, compare, compute_metrics, freeze,
@@ -1192,6 +1193,89 @@ class TestLabeledDataset(unittest.TestCase):
                          ["ALIGNED"])
         self.assertEqual(sorted(dimensions["sweep"].segments), ["true"])
         self.assertNotIn("regime", report.segmentation.unavailable)
+
+
+# ==========================================================================
+# Calendar and session dimensions (M14)
+# ==========================================================================
+
+class TestCalendarAndSessionDimensions(unittest.TestCase):
+    """`month`, `year`, `quarter` and `session` are registry entries, so every
+    metric is available across them without a line of report code."""
+
+    def report(self, records):
+        return build_report(records, inputs=sample_inputs(),
+                            segment_intervals=False)
+
+    def test_the_four_dimensions_reach_the_report(self):
+        import dataclasses
+
+        # Two months, two quarters, two years, two sessions.
+        stamps = [
+            int(datetime(2023, 2, 14, 9, tzinfo=timezone.utc).timestamp()),
+            int(datetime(2023, 2, 15, 9, tzinfo=timezone.utc).timestamp()),
+            int(datetime(2023, 8, 20, 18, tzinfo=timezone.utc).timestamp()),
+            int(datetime(2024, 8, 21, 18, tzinfo=timezone.utc).timestamp()),
+        ]
+        records = [
+            dataclasses.replace(record, boundary=stamp,
+                                h1_last_ts=stamp - HOUR,
+                                exit_T=stamp + HOUR, cycle_index=index)
+            for index, (record, stamp) in enumerate(
+                zip([win(2.0), loss(-1.0), win(1.0), loss(-1.0)], stamps))
+        ]
+        dimensions = self.report(records).segmentation.dimensions
+        self.assertEqual(sorted(dimensions["month"].segments),
+                         ["2023-02", "2023-08", "2024-08"])
+        self.assertEqual(sorted(dimensions["year"].segments), ["2023", "2024"])
+        self.assertEqual(sorted(dimensions["quarter"].segments),
+                         ["2023-Q1", "2023-Q3", "2024-Q3"])
+        self.assertEqual(sorted(dimensions["session"].segments),
+                         ["LONDON", "NEWYORK"])
+
+    def test_the_segments_partition_the_population(self):
+        records = spread([win(2.0), loss(-1.0), win(1.0), loss(-1.0)])
+        report = self.report(records)
+        scored = report.global_metrics.counts["scored_trades"]
+        for name in ("month", "year", "quarter", "session"):
+            entry = report.segmentation.dimensions[name]
+            total = sum(segment.counts.get("scored_trades", 0)
+                        for segment in entry.segments.values())
+            self.assertEqual(total, scored, name)
+            self.assertEqual(entry.excluded, 0, name)
+
+    def test_every_metric_is_available_across_a_new_dimension(self):
+        """The point of the registry: no metric has to be re-implemented per
+        dimension."""
+        records = spread([win(2.0), loss(-1.0), win(1.0)])
+        report = self.report(records)
+        month = next(iter(report.segmentation.dimensions["month"]
+                          .segments.values()))
+        for name in ("expectancy", "win_rate", "profit_factor", "payoff_ratio",
+                     "avg_win", "avg_loss", "max_drawdown_r"):
+            self.assertIn(name, month.values, name)
+
+    def test_adding_them_did_not_disturb_the_existing_dimensions(self):
+        records = spread([win(2.0), loss(-1.0)])
+        dimensions = self.report(records).segmentation.dimensions
+        for name in ("direction", "entry_mode", "weekday", "hour_of_day"):
+            self.assertIn(name, dimensions, name)
+
+    def test_a_new_dimension_changes_the_hash_but_not_the_global_numbers(self):
+        """Registering a dimension is additive: it adds segments to the hash and
+        leaves every existing number alone."""
+        records = spread([win(2.0), loss(-1.0), win(1.0)])
+        report = self.report(records)
+        without = build_report(
+            records, inputs=sample_inputs(), segment_intervals=False,
+            dimensions=[d for d in DIMENSIONS
+                        if d.name not in ("month", "year", "quarter",
+                                          "session")])
+        self.assertEqual(report.global_metrics.values,
+                         without.global_metrics.values)
+        self.assertEqual(report.global_metrics.counts,
+                         without.global_metrics.counts)
+        self.assertNotEqual(report.metrics_hash, without.metrics_hash)
 
 
 # ==========================================================================

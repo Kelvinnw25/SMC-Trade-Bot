@@ -51,6 +51,7 @@ from backtest.outcome.record import OutcomeRecord
 __all__ = [
     "DIMENSIONS",
     "DIMENSIONS_BY_NAME",
+    "SESSIONS",
     "Dimension",
     "SegmentSet",
     "Segmentation",
@@ -390,6 +391,63 @@ def _utc(epoch: int) -> datetime:
 
 
 # ---------------------------------------------------------------------------
+# Calendar and session (M14 — Phase 1 analytics)
+# ---------------------------------------------------------------------------
+#
+# All four bucket on `record.boundary` — **instantiation time**, the same basis
+# `weekday` and `hour_of_day` already use. The alternative basis is `exit_T`,
+# when the R was realised, which is what the C-9.8 equity path is ordered by.
+# The two disagree for any trade that spans a boundary, and a report that mixed
+# them would not close against `final_r`. The registry commits to instantiation
+# because that is the moment the strategy made a decision, which is the thing a
+# segmentation is asking about; a realisation-basis calendar is a derived block
+# in `backtest.analytics`, labelled as such.
+#
+# Keys sort lexicographically into chronological order (`2024-03` < `2024-11`,
+# `2024-Q1` < `2024-Q4`), so no report needs a custom comparator.
+
+def _month(record: OutcomeRecord, _labels: dict[str, Any]) -> Key:
+    return _utc(record.boundary).strftime("%Y-%m")
+
+
+def _year(record: OutcomeRecord, _labels: dict[str, Any]) -> Key:
+    return _utc(record.boundary).strftime("%Y")
+
+
+def _quarter(record: OutcomeRecord, _labels: dict[str, Any]) -> Key:
+    moment = _utc(record.boundary)
+    return f"{moment.year}-Q{(moment.month - 1) // 3 + 1}"
+
+
+#: UTC hour ranges, half-open `[start, end)`, exhaustive over 0-23.
+#:
+#: A **reporting convention, not strategy configuration** — nothing in `v2` knows
+#: these names, and no scoring input depends on them. The strategy's own time gate
+#: is the SNIPER window (Mon-Fri 07:00-22:00 UTC,
+#: [orchestrator.py:376](v2/app/orchestrator.py#L376)), which is segmented
+#: separately as `session_active` and is deliberately *not* reconciled with these
+#: edges: one is what the bot does, the other is how a reader groups the clock.
+SESSIONS: tuple[tuple[str, int, int], ...] = (
+    ("ASIA", 0, 7),
+    ("LONDON", 7, 12),
+    ("LONDON_NY_OVERLAP", 12, 16),
+    ("NEWYORK", 16, 21),
+    ("OFF", 21, 24),
+)
+
+
+def _session(record: OutcomeRecord, _labels: dict[str, Any]) -> Key:
+    hour = _utc(record.boundary).hour
+    for name, start, end in SESSIONS:
+        if start <= hour < end:
+            return name
+    # Unreachable while SESSIONS stays exhaustive; returning None rather than a
+    # bucket keeps an out-of-range hour visible as an exclusion instead of
+    # silently landing in whichever band happens to be last.
+    return None
+
+
+# ---------------------------------------------------------------------------
 # The registry
 # ---------------------------------------------------------------------------
 
@@ -440,6 +498,16 @@ DIMENSIONS: tuple[Dimension, ...] = (
               description="liquidity tier by processing rank", clause="C-5.6.2"),
     Dimension("weekday", _weekday, description="UTC weekday of instantiation"),
     Dimension("hour_of_day", _hour, description="UTC hour of instantiation"),
+    Dimension("month", _month,
+              description="UTC calendar month of instantiation (YYYY-MM)"),
+    Dimension("year", _year,
+              description="UTC calendar year of instantiation"),
+    Dimension("quarter", _quarter,
+              description="UTC calendar quarter of instantiation (YYYY-Qn)"),
+    Dimension("session", _session,
+              description="ASIA / LONDON / LONDON_NY_OVERLAP / NEWYORK / OFF — "
+                          "a reporting grouping of the UTC clock, distinct from "
+                          "the SNIPER gate segmented as session_active"),
     Dimension("strategy_version", _outcome_field("strategy_version"),
               description="lineage", clause="C-16.6.3"),
     Dimension("contract_version", _outcome_field("contract_version"),

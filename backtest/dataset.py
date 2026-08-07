@@ -30,6 +30,25 @@ one row per symbol per cycle, one cycle per `h1_last_ts`. For live data C-9.4 ad
 `cycle_index` to disambiguate, so the key carries it as a fourth, optional
 component and live joins remain exact rather than approximate.
 
+## The signal population (M14)
+
+`LabeledDataset` answers "what happened to the trades we took". `SignalPopulation`
+answers the complementary question the metrics engine structurally cannot: **what
+did the strategy decline, and why**. A `SKIP` or `WATCH` decision never
+instantiates a trade, so it has no `OutcomeRecord` and is invisible to every
+metric — yet on the official baseline that is 669,245 SKIP and 129,677 WATCH rows
+against 118,201 instantiations. Analysing the funnel needs the ledger itself.
+
+It lives here rather than in a new reader because of the sentence three
+paragraphs up: this module is the one place in the evaluation stack that opens
+`signal_ledger.jsonl`, and that invariant is worth more than the convenience of
+putting a second reader next to its only caller.
+
+It **streams**. `LabeledDataset` indexes the whole ledger by canonical key because
+a join needs random access; a population summary does not, so `SignalPopulation`
+holds counters bounded by the number of distinct decision/mode/score values rather
+than by the 1.27 GB file it reads.
+
 ## What this module never does
 
 It does not compute a metric, it does not write to any replay artifact, and it does
@@ -54,6 +73,7 @@ __all__ = [
     "LabeledDataset",
     "MANIFEST_FILENAME",
     "OUTCOMES_FILENAME",
+    "SignalPopulation",
     "canonical_key",
     "label_attributes",
     "read_outcomes",
@@ -375,6 +395,121 @@ class LabeledDataset:
             ledger_rows=len(labels), joined=joined,
             unjoined=len(records) - joined,
         )
+
+
+# ---------------------------------------------------------------------------
+# The signal population (M14)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SignalPopulation:
+    """What the strategy decided, across every analysed symbol-cycle.
+
+    The counterpart to `LabeledDataset`: that one describes trades, this one
+    describes **decisions**, including the overwhelming majority that never
+    became a trade. Counts only — no metric, no R, no expectancy. A decision that
+    produced no trade has no outcome to average, so any attempt to score this
+    population would be inventing a number.
+
+    Every mapping is keyed by the ledger's own vocabulary and is left exactly as
+    the ledger wrote it: `decision` is `SKIP`/`WATCH`/`VALID`/`A+`, `entry_mode`
+    is `NONE`/`CONTINUATION`/`RETRACEMENT` — and, if the strategy ever emits it,
+    `WATCH_ONLY`. Absent keys are absent, never zero-filled: "the strategy never
+    produced this" and "this bucket happens to be empty" are different facts.
+    """
+
+    ledger_rows: int = 0
+    by_decision: dict[str, int] = field(default_factory=dict)
+    by_entry_mode: dict[str, int] = field(default_factory=dict)
+    by_mode_decision: dict[str, int] = field(default_factory=dict)
+    by_direction: dict[str, int] = field(default_factory=dict)
+    by_score: dict[str, int] = field(default_factory=dict)
+    entry_ready: dict[str, int] = field(default_factory=dict)
+    #: The ledger's `reason` — why analysis declined to produce an entry. Absent
+    #: on rows that did produce one, so the counts here cover rejections only.
+    by_reason: dict[str, int] = field(default_factory=dict)
+    by_mode_reason: dict[str, int] = field(default_factory=dict)
+
+    #: Decisions that can carry an alert, in ascending tier order. `SKIP` and
+    #: `WATCH` are the two that never instantiate a trade under C-2.1.
+    ACTIONABLE = ("VALID", "A+")
+
+    @property
+    def actionable(self) -> int:
+        return sum(self.by_decision.get(name, 0) for name in self.ACTIONABLE)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ledger_rows": self.ledger_rows,
+            "by_decision": dict(sorted(self.by_decision.items())),
+            "by_entry_mode": dict(sorted(self.by_entry_mode.items())),
+            "by_mode_decision": dict(sorted(self.by_mode_decision.items())),
+            "by_direction": dict(sorted(self.by_direction.items())),
+            "by_score": dict(sorted(self.by_score.items(),
+                                    key=lambda item: _score_order(item[0]))),
+            "entry_ready": dict(sorted(self.entry_ready.items())),
+            "by_reason": dict(sorted(self.by_reason.items())),
+            "by_mode_reason": dict(sorted(self.by_mode_reason.items())),
+            "actionable": self.actionable,
+        }
+
+    @classmethod
+    def from_run(cls, run_dir: Path | str) -> "SignalPopulation":
+        """Stream `signal_ledger.jsonl` and tally. Memory is bounded by the number
+        of distinct keys, not by the size of the file."""
+        path = Path(run_dir) / LEDGER_FILENAME
+        if not path.exists():
+            raise DatasetError(
+                f"no {LEDGER_FILENAME} in {run_dir}. The signal population is the "
+                f"ledger; without it the decisions the strategy declined cannot be "
+                f"counted at all.")
+        rows = 0
+        decision: dict[str, int] = {}
+        mode: dict[str, int] = {}
+        mode_decision: dict[str, int] = {}
+        direction: dict[str, int] = {}
+        score: dict[str, int] = {}
+        ready: dict[str, int] = {}
+        reason: dict[str, int] = {}
+        mode_reason: dict[str, int] = {}
+
+        def tally(target: dict[str, int], key: Any) -> None:
+            if key is None or key == "":
+                return
+            name = str(key)
+            target[name] = target.get(name, 0) + 1
+
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                rows += 1
+                tally(decision, row.get("decision"))
+                tally(mode, row.get("entry_mode"))
+                tally(direction, row.get("direction"))
+                tally(score, row.get("score"))
+                tally(ready, row.get("entry_ready"))
+                tally(reason, row.get("reason"))
+                if row.get("entry_mode") and row.get("decision"):
+                    tally(mode_decision,
+                          f"{row['entry_mode']}|{row['decision']}")
+                if row.get("entry_mode") and row.get("reason"):
+                    tally(mode_reason, f"{row['entry_mode']}|{row['reason']}")
+        return cls(
+            ledger_rows=rows, by_decision=decision, by_entry_mode=mode,
+            by_mode_decision=mode_decision, by_direction=direction,
+            by_score=score, entry_ready=ready, by_reason=reason,
+            by_mode_reason=mode_reason)
+
+
+def _score_order(key: str) -> tuple[int, Any]:
+    """Numeric scores sort numerically; anything else sorts after, by text."""
+    try:
+        return (0, int(float(key)))
+    except (TypeError, ValueError):
+        return (1, key)
 
 
 def _key_of(record: OutcomeRecord) -> CanonicalKey:

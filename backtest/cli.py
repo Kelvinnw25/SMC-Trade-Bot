@@ -9,6 +9,7 @@ REPLAY_CONTRACT.md §10 ("cli.py — entry points"), §11. Milestone M11.
     python -m backtest replay          --corpus DATA --out RUNS --start ... --end ...
     python -m backtest outcome         --corpus DATA --run RUNS/runs/<run_id>
     python -m backtest audit           --run RUNS/runs/<run_id>
+    python -m backtest analytics       --run RUNS/runs/<run_id>
     python -m backtest metrics         --run RUNS/runs/<run_id>
     python -m backtest freeze          --run ... --out baselines/v2.0 --label ...
     python -m backtest splits          --start ... --end ... --train 4000 --test 2000
@@ -444,6 +445,66 @@ def _metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def _analytics(args: argparse.Namespace) -> int:
+    """Assemble Phase 1 research analytics over a finished, resolved run.
+
+    Reads `metrics.json`, `outcomes.jsonl` and `signal_ledger.jsonl`; writes only
+    into its own output directory. It never runs replay, outcome or metrics —
+    §11 keeps those separate, and a command that silently spends hours of compute
+    is a command nobody can predict.
+    """
+    from backtest.analytics import ANALYTICS_DIRNAME, AnalyticsError, analyse_run
+
+    try:
+        report = analyse_run(args.run)
+    except AnalyticsError as exc:
+        raise SystemExit(str(exc)) from exc
+    out = Path(args.out) if args.out else Path(args.run) / ANALYTICS_DIRNAME
+    written = report.write(out)
+    identity = report.identity
+    _emit({"run_id": identity.get("run_id"),
+           "metrics_hash": identity.get("metrics_hash"),
+           "strategy_version": identity.get("strategy_version"),
+           "written_to": {name: str(path) for name, path in written.items()}})
+    _say(f"analytics written to {out}")
+    return 0
+
+
+def _research(args: argparse.Namespace) -> int:
+    """Phase 3 strategy studies over a finished, resolved run.
+
+    A separate verb from `analytics` because the cost is different: the studies
+    join the whole signal ledger and run several hundred bootstrap comparisons,
+    where `analytics` reads `metrics.json` and finishes in seconds. Same
+    reasoning §11 uses to keep replay, outcome and metrics apart.
+    """
+    from backtest.analytics import ANALYTICS_DIRNAME, AnalyticsError
+    from backtest.analytics.core import _identity, _read_optional_json
+    from backtest.analytics.studies import (
+        RESEARCH_DIRNAME, run_studies, write_studies,
+    )
+    from backtest.metrics import METRICS_FILENAME
+
+    run_dir = Path(args.run)
+    try:
+        studies = run_studies(run_dir)
+    except AnalyticsError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    metrics = _read_optional_json(run_dir / METRICS_FILENAME) or {}
+    identity = _identity(metrics, _read_optional_json(run_dir / "manifest.json"),
+                         run_dir)
+    out = (Path(args.out) if args.out
+           else run_dir / ANALYTICS_DIRNAME / RESEARCH_DIRNAME)
+    written = write_studies(studies, out, identity=identity)
+    _emit({"run_id": identity.get("run_id"),
+           "metrics_hash": identity.get("metrics_hash"),
+           "studies": sorted(studies),
+           "written_to": str(out), "files": len(written)})
+    _say(f"{len(studies)} studies written to {out}")
+    return 0
+
+
 def _audit(args: argparse.Namespace) -> int:
     """Verify a finished run bundle against itself and against the contract.
 
@@ -712,6 +773,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace an existing report; a re-derivation replaces its "
              "predecessor deliberately, never silently")
     metrics.set_defaults(func=_metrics)
+
+    # -- analytics ---------------------------------------------------------
+    analytics = sub.add_parser(
+        "analytics", help="Phase 1 research analytics over a finished run")
+    analytics.add_argument("--run", required=True, type=Path,
+                           help="a run directory: <out>/runs/<run_id>")
+    analytics.add_argument(
+        "--out", type=Path, default=None,
+        help="output directory; defaults to <run>/analytics/ so the audited "
+             "bundle's own files are never touched")
+    analytics.set_defaults(func=_analytics)
+
+    # -- research ----------------------------------------------------------
+    research = sub.add_parser(
+        "research", help="Phase 3 strategy studies over a finished run")
+    research.add_argument("--run", required=True, type=Path,
+                          help="a run directory: <out>/runs/<run_id>")
+    research.add_argument(
+        "--out", type=Path, default=None,
+        help="output directory; defaults to <run>/analytics/research/")
+    research.set_defaults(func=_research)
 
     # -- audit -----------------------------------------------------------
     audit = sub.add_parser(
