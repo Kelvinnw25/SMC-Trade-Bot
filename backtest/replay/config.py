@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from backtest.data.repository import canonical_json
 from backtest.lineage import STRATEGY_VERSION, environment
+from v2.analysis.scoring_config import DEFAULT_SCORING_CONFIG, ScoringConfig
 from v2.app.ledger import CONTRACT_VERSION
 from v2.domain.signal_ledger import LEDGER_SCHEMA_VERSION
 from v2.lifecycle.rules import LifecycleConfig
@@ -107,8 +108,33 @@ class ReplayConfig:
     #: share a `run_id` and therefore an output directory, so a cached-vs-uncached
     #: comparison must direct them at different `output_root`s.
     caching_analyzer: bool = False
+    #: The scoring seam (`v2.analysis.scoring_config`). Defaults to 2.2.0's own
+    #: table, so an unmodified config replays the baseline.
+    #:
+    #: **Deliberately absent from `core()`**, which C-16.2 defines as a closed
+    #: list this module may not extend. The variant's identity reaches `run_id`
+    #: through `strategy_version` instead — already a `core` member, and exactly
+    #: what `experiments.config.variant_version` produces. `__post_init__` refuses
+    #: the combination that would make that indirection unsound.
+    scoring_config: ScoringConfig = DEFAULT_SCORING_CONFIG
 
     def __post_init__(self) -> None:
+        if (self.scoring_config is not DEFAULT_SCORING_CONFIG
+                and self.strategy_version == STRATEGY_VERSION):
+            # A variant that keeps the base version hashes to the BASELINE's
+            # run_id, so it resolves to the baseline's output directory. Without
+            # `overwrite` the driver refuses (driver.py:554); with it, the driver
+            # unlinks the existing sinks (driver.py:561) — i.e. this mistake
+            # deletes the frozen baseline's ledger, lifecycle events and memory
+            # snapshots. Refusing here is the only place it is still cheap.
+            raise ConfigError(
+                f"a non-default scoring_config was supplied with the base "
+                f"strategy_version {self.strategy_version!r}. `scoring_config` is "
+                f"not in `core()` (C-16.2 is a closed list), so this run would "
+                f"hash to the baseline's run_id and write into the baseline's "
+                f"directory. Set strategy_version to the variant's version — "
+                f"experiments.config.variant_version(base, slug, variant_id) — "
+                f"which is what makes the variant a distinct run.")
         if self.start % H1_SECONDS != 0:
             raise ConfigError(
                 f"T_0 ({self.start}) is not on an hour: T mod 3600 must be 0 (C-5.1)"

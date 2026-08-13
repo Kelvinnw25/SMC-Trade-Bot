@@ -973,6 +973,24 @@ class TestRunLineage(OutcomeCase):
         self.assertEqual(lineage.data_snapshot_id, "snap0123456789ab")
         self.assertTrue(lineage.declared)
 
+    def test_the_manifest_reader_also_recovers_the_universe_depth(self):
+        """`top_coins_limit` is a `ComparisonKey` input, so it must be declared.
+
+        Two runs over different universe depths are not the same experiment. It is
+        read from `core` like every other lineage value, and stays None when the
+        manifest does not state it rather than defaulting to a guess.
+        """
+        run_dir = self.tmp / "run-top"
+        self.manifest(run_dir, top_coins_limit=30)
+        self.assertEqual(read_run_lineage(run_dir).top_coins_limit, 30)
+
+    def test_an_undeclared_universe_depth_stays_none(self):
+        run_dir = self.tmp / "run-notop"
+        self.manifest(run_dir)
+        lineage = read_run_lineage(run_dir)
+        self.assertIsNone(lineage.top_coins_limit)
+        self.assertIn("top_coins_limit", lineage.to_dict())
+
     def test_a_missing_manifest_is_an_error_not_an_empty_lineage(self):
         with self.assertRaises(LineageError):
             read_run_lineage(self.tmp / "nowhere")

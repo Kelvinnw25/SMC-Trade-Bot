@@ -22,11 +22,12 @@ from __future__ import annotations
 import dataclasses
 import random
 import unittest
+import zlib
 from pathlib import Path
 
 import pandas as pd
 
-from src.strategy import SMCStrategy
+from tests.regression.v1_recorded import SMCStrategy
 from tests.analysis.observable_bridge import v2_observable
 from tests.analysis.test_order_block import (
     build_frame,
@@ -348,8 +349,13 @@ class TestM5Enrichment(unittest.TestCase):
             context = strategy.build_signal_context(d1, h1)
             if int(context["result"].get("score", 0)) < 8:
                 continue
+            # crc32, not hash(): str hashing is salted per process, so hash(name)
+            # produced a different M5 frame on every run. That was invisible while
+            # V1 was called live (both sides saw the same frame within a run) and
+            # surfaced the moment V1's answers became recorded.
             m5 = _m5_frame(
-                40, random.Random(hash(name) & 0xFFFF), 200.0, rng.choice((-0.3, 0.3))
+                40, random.Random(zlib.crc32(name.encode()) & 0xFFFF), 200.0,
+                rng.choice((-0.3, 0.3)),
             )
             v1_result = strategy.enrich_with_m5(context, m5)
 

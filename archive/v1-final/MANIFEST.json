@@ -1,0 +1,173 @@
+{
+  "archive": "v1-final",
+  "created_utc": "2026-08-14",
+  "git_tag": "v1-final",
+  "tagged_commit": "b7c2afa6a7a7920431d1d6ab3cd1e682096df1f9",
+  "head_at_archive": "b7c2afa6a7a7920431d1d6ab3cd1e682096df1f9",
+  "v1_source_lines": 3617,
+  "golden_records": {
+    "build_signal_context": 120,
+    "classify_regime": 16,
+    "cluster_liquidity_levels": 6,
+    "detect_sweep": 25,
+    "enrich_with_m5": 32,
+    "find_liquidity_target": 292,
+    "get_previous_day_high_low": 1,
+    "identify_swings": 25,
+    "is_market_choppy": 34,
+    "is_poi_invalidated": 7200,
+    "score_signal": 3006
+  },
+  "files": [
+    {
+      "path": "docs/BLUEPRINT.md",
+      "bytes": 24706,
+      "sha256": "17c84fca7c297ea3e3d57bf1a216840148f17f480b9f03a7718782e2a0ca0b70"
+    },
+    {
+      "path": "docs/MODULE_INTENT.md",
+      "bytes": 46501,
+      "sha256": "c7fae40a4e7234d7a973693f66ef83457b4511018f6c8609b0aeb6db52ace285"
+    },
+    {
+      "path": "equivalence-proof/fixtures/synthetic_short.golden.json",
+      "bytes": 1114,
+      "sha256": "4031d28a2fceb6099e8460ff9fe851ab8fe4a00220710e001772ce8c8df24f70"
+    },
+    {
+      "path": "equivalence-proof/fixtures/synthetic_short.json",
+      "bytes": 67827,
+      "sha256": "ff2e8311003b3677d334bff6ee79d5c62a771f97ccc69c19ea38b54cba0afc44"
+    },
+    {
+      "path": "equivalence-proof/goldens/build_signal_context.jsonl",
+      "bytes": 297393,
+      "sha256": "b5d4ceb08419ed3158306f9f9b299fac22611fb64633a1e72f0e357d3c66eca9"
+    },
+    {
+      "path": "equivalence-proof/goldens/classify_regime.jsonl",
+      "bytes": 1663,
+      "sha256": "1168f4df58e69089834f703a699751d87cfe5b9b343a87e391c310fab36384ea"
+    },
+    {
+      "path": "equivalence-proof/goldens/cluster_liquidity_levels.jsonl",
+      "bytes": 1434,
+      "sha256": "a8a001bee4c86649705d592183e42376da1e82200d704710c3ab3433726fc974"
+    },
+    {
+      "path": "equivalence-proof/goldens/detect_sweep.jsonl",
+      "bytes": 3245,
+      "sha256": "c4e683ec81ce32de7c276e504f09740f2f8729a71a7d2a0defe104bf5e46f3ee"
+    },
+    {
+      "path": "equivalence-proof/goldens/enrich_with_m5.jsonl",
+      "bytes": 21571,
+      "sha256": "017f57a2e3cdfaf1c07f80195853bd54e43e12ce4778af6abc01af8679575de1"
+    },
+    {
+      "path": "equivalence-proof/goldens/find_liquidity_target.jsonl",
+      "bytes": 69715,
+      "sha256": "7aa6690cfa2ed779eb32e342ea9280a14a7d3f6f240ae8f001f74f7f803f5792"
+    },
+    {
+      "path": "equivalence-proof/goldens/get_previous_day_high_low.jsonl",
+      "bytes": 167,
+      "sha256": "5e7252fecb8ba75925c609481dec70e6ccd085f5af509ed80cb9f905f8097302"
+    },
+    {
+      "path": "equivalence-proof/goldens/identify_swings.jsonl",
+      "bytes": 28284,
+      "sha256": "2a468e9466455fc6c9a46af4c2d10f378274fc9ef7c101e4444525338b4765b3"
+    },
+    {
+      "path": "equivalence-proof/goldens/is_market_choppy.jsonl",
+      "bytes": 3328,
+      "sha256": "effb9646b1394f0ffeb7a3d94516e507a941e12113e845666c01286d2ded0312"
+    },
+    {
+      "path": "equivalence-proof/goldens/is_poi_invalidated.jsonl",
+      "bytes": 703540,
+      "sha256": "30793db3ccc771eb5dc68461281502265fc3e52fd08d40659cc9f7c1d5072a1a"
+    },
+    {
+      "path": "equivalence-proof/goldens/score_signal.jsonl",
+      "bytes": 759216,
+      "sha256": "0ec941ac89f2bb0d17f3a58d8891cb70ce5bedb4cb05a91c21aef91d43e1a560"
+    },
+    {
+      "path": "migration/IMPLEMENTATION_PLAN.md",
+      "bytes": 50044,
+      "sha256": "e47341631ed9dc7eca9766130cf192518064ac25b24086c7d7376464b5f284aa"
+    },
+    {
+      "path": "runtime/main.py",
+      "bytes": 34147,
+      "sha256": "bb81b1fed4ba40559ff5a0b77379d3201668bb8707c2e33156b29aa99dcb6150"
+    },
+    {
+      "path": "scripts/debug_api.py",
+      "bytes": 1140,
+      "sha256": "c81cb56cd3a500d92b141a2ec99a64383668d3528fac93fffa4d4ba01dff683c"
+    },
+    {
+      "path": "scripts/final_test.py",
+      "bytes": 1601,
+      "sha256": "0e41f9d327a4db2c4471ff86f948f1c58eebd4a632d46482564a849bcd95f321"
+    },
+    {
+      "path": "scripts/test_api.py",
+      "bytes": 1004,
+      "sha256": "edd1708f4a70f9e15083fe1a889c0da4fcbc7f54c42fc3d751c234c0c4a57b91"
+    },
+    {
+      "path": "scripts/test_strategy.py",
+      "bytes": 4536,
+      "sha256": "0f64e843ca733e8f1f61bc31d89a2c72d7a29c8e6056315fc404da352477bc98"
+    },
+    {
+      "path": "src/api_handler.py",
+      "bytes": 5965,
+      "sha256": "a0a4f3ea4d358340c78cf4b0bd93bb85a7eb064cf7823ad24fe337822e1fc7c6"
+    },
+    {
+      "path": "src/config.py",
+      "bytes": 1324,
+      "sha256": "d8dcb660a192426421c25a6ee7ad6ce87028b6d84a0cbfbd8b24fc65f49d265d"
+    },
+    {
+      "path": "src/executor.py",
+      "bytes": 6672,
+      "sha256": "06c0f27ccfee81c380a5ffff915ac42cc14db5a8d992e026876da16ff8061493"
+    },
+    {
+      "path": "src/strategy.py",
+      "bytes": 74968,
+      "sha256": "90c6ea520ed26f0ec9f65e57510dd84fdb27d9e91e9fbb7b588c4d6c4ba79208"
+    },
+    {
+      "path": "src/telegram_notifier.py",
+      "bytes": 7044,
+      "sha256": "bf289d004d8d908ce4075b97c08a12348e3d2496737edd0e5c6aacc9e5575b1f"
+    },
+    {
+      "path": "tests/oracle_live_v1.py",
+      "bytes": 14486,
+      "sha256": "f5160a77c6150d56a40f5bef70dfbd4c06f7c3580aea0f5a2b3767d972dfeefd"
+    },
+    {
+      "path": "tests/test_lifecycle_equivalence_at_retirement.py",
+      "bytes": 8704,
+      "sha256": "7077b43bc8850ff88d597ac197dd41b22eb1fd38496449f96c794aa3f69cd617"
+    },
+    {
+      "path": "tests/test_oracle_at_retirement.py",
+      "bytes": 9651,
+      "sha256": "a9a6df7aac47c028b352bd8285ccc6e463015e1130baa483d6a83b15da5af444"
+    },
+    {
+      "path": "tests/v1_reference_live_v1.py",
+      "bytes": 15064,
+      "sha256": "979f4f4a2d2e1361909af47e3232a19da258ad5a3f671491e672da5c209dc4ec"
+    }
+  ]
+}

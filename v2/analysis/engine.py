@@ -31,7 +31,7 @@ from __future__ import annotations
 from typing import Optional
 
 from v2.analysis.context import AnalysisContext
-from v2.analysis.pipeline import AnalysisPipeline
+from v2.analysis.pipeline import AnalysisPipeline, scoring_config_of
 from v2.analysis.scoring import enrich_with_m5
 from v2.domain import MarketSnapshot, Signal
 
@@ -101,6 +101,14 @@ class V2Analyzer:
             )
 
         if signal.score >= _M5_SCORE_GATE and snapshot.m5 is not None:
-            signal = enrich_with_m5(signal, snapshot.m5, session_active=session_active)
+            # The M5 re-score is the one scoring call outside a stage, so it takes
+            # its config from the pipeline's scoring stage rather than holding a
+            # copy — see `scoring_config_of`.
+            signal = enrich_with_m5(
+                signal,
+                snapshot.m5,
+                session_active=session_active,
+                config=scoring_config_of(self._pipeline),
+            )
 
         return signal

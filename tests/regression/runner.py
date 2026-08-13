@@ -25,8 +25,8 @@ from typing import Any, Optional
 
 from tests.regression.compare import ComparisonReport, compare_field_maps
 from tests.regression.observable import ObservableBehavior
-from tests.regression.oracle import Analyzer, V1Oracle
 from tests.regression.snapshot import InputSnapshot
+from tests.regression.v1_projection import Analyzer
 
 
 def _as_market_snapshot(snapshot: Any) -> Any:
@@ -81,9 +81,16 @@ def capture_golden(
     analyzer: Optional[Analyzer] = None,
     prior: Optional[dict[str, Any]] = None,
 ) -> ObservableBehavior:
-    """Capture the reference observable for a snapshot (V1 oracle by default)."""
+    """Capture the reference observable for a snapshot (V1 oracle by default).
+
+    The default oracle is imported lazily so this module carries no import-time
+    dependency on the oracle binding; see `tests/regression/oracle.py`.
+    """
     market = _as_market_snapshot(snapshot)
-    analyzer = analyzer if analyzer is not None else V1Oracle()
+    if analyzer is None:
+        from tests.regression.oracle import V1Oracle
+
+        analyzer = V1Oracle()
     return analyzer.analyze(market, prior=prior)
 
 

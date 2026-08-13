@@ -30,15 +30,21 @@ from v2.analysis.order_block import OrderBlockStage
 from v2.analysis.regime import RegimeStage
 from v2.analysis.risk import RiskStage
 from v2.analysis.scoring import ScoringStage
+from v2.analysis.scoring_config import DEFAULT_SCORING_CONFIG, ScoringConfig
 from v2.analysis.stage import AnalysisStage
 from v2.analysis.structure import StructureStage
 
 
-def default_stages() -> tuple[AnalysisStage, ...]:
+def default_stages(
+    config: ScoringConfig = DEFAULT_SCORING_CONFIG,
+) -> tuple[AnalysisStage, ...]:
     """The canonical analysis chain, in dependency order.
 
     Adding a stage means inserting it here (and adding its context field) —
     nothing else in the layer changes.
+
+    `config` is threaded to the one stage that reads it. It is a plain argument
+    with a default, so `default_stages()` is unchanged for every existing caller.
     """
     return (
         HTFStage(),
@@ -49,8 +55,24 @@ def default_stages() -> tuple[AnalysisStage, ...]:
         FairValueGapStage(),
         EntryStage(),
         RiskStage(),
-        ScoringStage(),
+        ScoringStage(config),
     )
+
+
+def scoring_config_of(pipeline: object) -> ScoringConfig:
+    """The `ScoringConfig` any pipeline-shaped object runs under.
+
+    Takes `object` rather than `AnalysisPipeline` deliberately: the replay
+    harness wraps the pipeline in a memoizing duck-typed stand-in that forwards
+    `.stages`, and it must resolve to the same config as the pipeline it wraps.
+    Reading through `.stages` rather than requiring a new attribute is what lets
+    that keep working without the wrapper being changed.
+    """
+    for stage in getattr(pipeline, "stages", ()):
+        config = getattr(stage, "config", None)
+        if isinstance(config, ScoringConfig):
+            return config
+    return DEFAULT_SCORING_CONFIG
 
 
 class AnalysisPipeline:
@@ -60,13 +82,30 @@ class AnalysisPipeline:
         self._stages: tuple[AnalysisStage, ...] = tuple(stages)
 
     @classmethod
-    def default(cls) -> "AnalysisPipeline":
-        """The full analysis chain."""
-        return cls(default_stages())
+    def default(
+        cls, config: ScoringConfig = DEFAULT_SCORING_CONFIG
+    ) -> "AnalysisPipeline":
+        """The full analysis chain, optionally under a variant scoring config."""
+        return cls(default_stages(config))
 
     @property
     def stages(self) -> tuple[AnalysisStage, ...]:
         return self._stages
+
+    @property
+    def scoring_config(self) -> ScoringConfig:
+        """The `ScoringConfig` this pipeline's scoring stage runs under.
+
+        Read off the stage rather than stored alongside it, so a pipeline and
+        its scoring stage cannot disagree. `V2Analyzer` uses this for the M5
+        re-score, which is the one scoring call that happens outside a stage — a
+        second copy of the config would be a second place for it to drift.
+
+        A partial pipeline composed without a scoring stage (as several stage
+        tests do) reports the default; it does no scoring, so there is nothing
+        for the answer to be wrong about.
+        """
+        return scoring_config_of(self)
 
     @property
     def stage_names(self) -> tuple[str, ...]:

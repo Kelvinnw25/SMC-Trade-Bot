@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.strategy import SMCStrategy
+from tests.regression.v1_recorded import SMCStrategy
 from tests.regression.snapshot import InputSnapshot
 from v2.analysis.context import AnalysisContext
 from v2.analysis.frames import H1_MIN_ROWS, safe_frame

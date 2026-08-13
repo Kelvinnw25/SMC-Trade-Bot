@@ -309,8 +309,10 @@ def _coverage(args: argparse.Namespace) -> int:
 def _replay(args: argparse.Namespace) -> int:
     from backtest.corpus import open_corpus
     from backtest.replay import ReplayConfig, ReplayDriver
+    from v2.analysis.scoring_config import DEFAULT_SCORING_CONFIG
 
     from backtest.observe import JobRecorder, preserve_failed_run
+    from backtest.replay.config import STRATEGY_VERSION
     from backtest.universe import resolve
 
     repository = open_corpus(args.corpus)
@@ -318,6 +320,26 @@ def _replay(args: argparse.Namespace) -> int:
     # stops the run in seconds with a worklist rather than after hours of cycles.
     resolution = resolve(repository.symbols("1h"), corpus_root=args.corpus,
                          table_path=args.universe_table)
+
+    # The scoring seam. Resolved before the run is configured, for the same reason
+    # the universe is: `load_scoring_variant` refuses an unknown component or an
+    # unimplemented block, and that refusal is worth having in milliseconds rather
+    # than after 7.8 hours of cycles.
+    scoring_config = DEFAULT_SCORING_CONFIG
+    strategy_version = STRATEGY_VERSION
+    if args.variant:
+        from backtest.experiments.scoring_variant import load_scoring_variant
+
+        experiment, scoring_config = load_scoring_variant(
+            args.variant, root=args.experiment)
+        # The variant's identity reaches `run_id` through `strategy_version`,
+        # which is already a `core` member — `scoring_config` is not, and C-16.2's
+        # `core` is a closed list. `ReplayConfig.__post_init__` refuses the
+        # combination that would collide with the baseline.
+        strategy_version = experiment.variant_version
+        _say(f"variant {experiment.slug} ({experiment.variant_id}) "
+             f"-> strategy_version {strategy_version}")
+
     config = ReplayConfig(
         repository_root=Path(args.corpus) / "canonical",
         output_root=Path(args.out),
@@ -332,6 +354,8 @@ def _replay(args: argparse.Namespace) -> int:
         # or the output directory — which is exactly why a cached-vs-uncached
         # comparison must point the two arms at different `--out` roots.
         caching_analyzer=args.caching_analyzer,
+        scoring_config=scoring_config,
+        strategy_version=strategy_version,
     )
     progress, log = _observability(args, args.out, "replay",
                                    unit="cycles", rate_name=" replay-h/s")
@@ -528,6 +552,210 @@ def _audit(args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
+def _identity(args: argparse.Namespace) -> int:
+    """Re-score a finished run's ledger and diff against what it recorded.
+
+    The cheap half of a baseline identity check: `score_signal` is re-run over
+    every ledger row's recorded inputs, so a change to the score engine or its
+    thresholds fails here in minutes instead of surviving until someone spends
+    ~7.8 h on a replay. It deliberately proves less than a replay — the report
+    carries its own `scope` block, and exit 1 on any mismatch.
+    """
+    from backtest.experiments.identity import rescore_ledger
+
+    report = rescore_ledger(args.run)
+    payload = report.to_dict()
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                       encoding="utf-8")
+        payload["written_to"] = str(out)
+    _emit(payload)
+    _say(f"{'PASS' if report.passed else 'FAIL'}: {report.matched}/"
+         f"{report.compared} scored rows reproduced, {report.mismatch_count} "
+         f"mismatch(es); {report.skipped} row(s) took a pre-scoring exit")
+    return 0 if report.passed else 1
+
+
+def _tier0(args: argparse.Namespace) -> int:
+    """Slot-aware counterfactual over a finished run's resolved outcomes.
+
+    Not a replay: it re-decides admission only, and lets `CAPPED` candidates take
+    the slots a rule frees. Writes nothing unless `--out` is given.
+    """
+    from backtest.dataset import LabeledDataset
+    from backtest.experiments.tier0 import (
+        AdmissionRule, Clause, Tier0Error, load_occupancy, simulate,
+    )
+
+    clauses = []
+    for raw in args.reject:
+        fields = {}
+        for part in str(raw).split(","):
+            if not part.strip():
+                continue
+            if "=" not in part:
+                raise SystemExit(
+                    f"--reject clause {raw!r}: expected key=value pairs "
+                    f"separated by commas, got {part!r}")
+            key, _, value = part.partition("=")
+            key = key.strip()
+            if key not in ("direction", "location", "d1_bias"):
+                raise SystemExit(
+                    f"--reject clause {raw!r}: {key!r} is not one of "
+                    f"direction / location / d1_bias")
+            fields[key] = value.strip()
+        try:
+            clauses.append(Clause(**fields))
+        except Tier0Error as exc:
+            raise SystemExit(str(exc)) from exc
+
+    rule = AdmissionRule(name=args.name, reject=tuple(clauses))
+    dataset = LabeledDataset.from_run(args.run)
+    try:
+        occupancy = load_occupancy(args.run)
+        result = simulate(dataset.records, occupancy, rule,
+                          labels_for=dataset.labels_for,
+                          promoted_residency_cycles=args.promoted_residency)
+    except Tier0Error as exc:
+        raise SystemExit(str(exc)) from exc
+
+    payload = result.to_dict()
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                       encoding="utf-8")
+        payload["written_to"] = str(out)
+    _emit(payload)
+    _say(f"{rule.name}: baseline {result.baseline_net_r:+.1f}R -> "
+         f"counterfactual {result.counterfactual_net_r:+.1f}R "
+         f"(delta {result.delta_net_r:+.1f}R; ignoring substitution would have "
+         f"said {result.naive_delta_net_r:+.1f}R); slack={result.slack}")
+    return 0
+
+
+def _phase_a(args: argparse.Namespace) -> int:
+    """Phase A tier-0 studies over a finished run. No replay; writes only --out.
+
+    A1's `never_fires` result is the only one that is *provable* rather than
+    statistical, so it is surfaced on the terminal line: if removing components
+    that never fire changes any score, the census behind the whole programme is
+    wrong and nothing downstream is interpretable.
+    """
+    from backtest.experiments.phase_a import (
+        RESULTS_DIRNAME, run_phase_a, write_phase_a,
+    )
+
+    run_dir = Path(args.run)
+    studies = run_phase_a(run_dir, experiments_root=args.experiments)
+    out = (Path(args.out) if args.out
+           else run_dir / "analytics" / "research" / RESULTS_DIRNAME)
+    written = write_phase_a(studies, out)
+
+    a1 = studies["a1_dead_score_components"].payload["verdict"]
+    a8 = studies["a8_quality_filter_falsification"].payload
+    bit_neutral = a1["never_fires_removable_bit_neutrally"]
+    _emit({"studies": sorted(studies), "written_to": str(out),
+           "files": len(written),
+           "a1_never_fires_bit_neutral": bit_neutral,
+           "a8_pruning_confirmed": a8["pruning_confirmed"]})
+    _say(f"{len(studies)} Phase A studies written to {out}; "
+         f"A1 never-fires bit-neutral={bit_neutral}, "
+         f"A8 pruning={a8['pruning_confirmed']}")
+    return 0
+
+
+def _anchor(args: argparse.Namespace) -> int:
+    """Derive quantile-anchored decision thresholds from TRAIN. No replay.
+
+    Reads a finished run's ledger, matches each variant's admitted fraction per
+    entry mode to the 2.2.0 baseline's, and prints the integers. `--apply` is what
+    writes them into the experiment config, and it is opt-in because it mints a
+    new `variant_id`: thresholds are strategy inputs, so replacing a declared
+    anchor with the integers it resolved to is a different variant.
+    """
+    from backtest.experiments.anchor import apply_to_config, derive, write_report
+    from backtest.experiments.config import load_config
+
+    run_dir = Path(args.run)
+    root = Path(args.root)
+    out = Path(args.out) if args.out else None
+
+    summary = []
+    for slug in args.slug:
+        config = load_config(root / slug / "config.json")
+        report = derive(run_dir, config, role=args.role)
+        entry = {"slug": slug, "variant_id": report.variant_id,
+                 "rows_train": report.rows,
+                 "thresholds": report.thresholds,
+                 "max_cumulative_rate_delta": round(report.max_rate_delta, 6)}
+        if out is not None:
+            entry["report"] = str(write_report(report, out))
+        if args.apply:
+            path, before, after = apply_to_config(root, slug, report)
+            entry["config"] = str(path)
+            entry["variant_id_before"] = before
+            entry["variant_id_after"] = after
+        summary.append(entry)
+        _say(f"{slug}: {report.thresholds} "
+             f"(max rate delta {report.max_rate_delta:.6f}"
+             f"{', applied' if args.apply else ', not applied'})")
+
+    _emit({"role": args.role, "run": str(run_dir), "variants": summary})
+    return 0
+
+
+def _screen(args: argparse.Namespace) -> int:
+    """Tier-0 screen of scoring variants. No replay, and it cannot promote.
+
+    The dataset and the occupancy are built once and shared across variants: both
+    are functions of the run, not of the variant, and rebuilding them per variant
+    would triple the read for identical bytes.
+    """
+    from backtest.dataset import LabeledDataset
+    from backtest.experiments.config import load_config
+    from backtest.experiments.screen import screen_variant, write_screen
+    from backtest.experiments.tier0 import load_occupancy
+
+    run_dir = Path(args.run)
+    root = Path(args.root)
+    dataset = LabeledDataset.from_run(run_dir)
+    occupancy = load_occupancy(run_dir)
+
+    out = (Path(args.out) if args.out
+           else run_dir / "analytics" / "research" / "results")
+
+    summary = []
+    for slug in args.slug:
+        config = load_config(root / slug / "config.json")
+        screen = screen_variant(run_dir, config, dataset=dataset,
+                                occupancy=occupancy)
+        path = write_screen(screen, out)
+        payload = screen.to_dict()
+        summary.append({
+            "slug": slug, "variant_id": screen.variant_id,
+            "written_to": str(path),
+            "books": payload["books"],
+            "attribution": payload["attribution"]["variant_vs_baseline"],
+            "beats_control": screen.beats_control,
+            "coverage": payload["coverage"],
+            "identity_slack": screen.identity_result.slack,
+        })
+        _say(f"{slug}: n={screen.variant.n} E={screen.variant.expectancy:+.4f} "
+             f"totalR={screen.variant.total_r:+.1f} "
+             f"(control E={screen.control.expectancy:+.4f}) "
+             f"beats_control={screen.beats_control} | "
+             f"observable {screen.coverage.admit_to_skip} of "
+             f"{screen.coverage.admit_to_skip + screen.coverage.skip_to_admit} "
+             f"moved rows")
+
+    _emit({"run": str(run_dir), "out": str(out),
+           "cannot_promote": True, "variants": summary})
+    return 0
+
+
 def _freeze(args: argparse.Namespace) -> int:
     from backtest.dataset import LABEL_FIELDS, LabeledDataset
     from backtest.lineage import read_run_lineage
@@ -535,12 +763,22 @@ def _freeze(args: argparse.Namespace) -> int:
 
     dataset = LabeledDataset.from_run(args.run)
     lineage = read_run_lineage(args.run)
+    # C-5.7.2's four preconditions must all be *declared*, and `burn_in_h1` /
+    # `universe_mode` are recoverable from no OutcomeRecord — so they come from
+    # the manifest's `core`, the same mapping the run_id hashes. Omitting them
+    # (as this function did) makes `freeze` refuse the run, which is why the
+    # official 2.2.0 baseline could not be frozen. Reading them rather than
+    # accepting them as flags is deliberate: a declaration typed at the command
+    # line can disagree with what actually ran.
     report = build_report(
         dataset.records, labels=dataset.labels, health=dataset.health.to_dict(),
         dataset=dataset.to_dict(),
         inputs=ReportInputs(
             run_id=(dataset.records[0].run_id if dataset.records else ""),
             window_start=lineage.window_start, window_end=lineage.window_end,
+            burn_in_h1=lineage.burn_in_h1,
+            universe_mode=lineage.universe_mode,
+            top_coins_limit=lineage.top_coins_limit,
             label_fields=LABEL_FIELDS))
     baseline = freeze(report, args.out, label=args.label)
     _emit(baseline.to_dict() if hasattr(baseline, "to_dict")
@@ -734,6 +972,16 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--start", required=True, type=_boundary)
     replay.add_argument("--end", required=True, type=_boundary)
     replay.add_argument("--burn-in", type=int, default=336, dest="burn_in")
+    replay.add_argument(
+        "--experiment", type=Path,
+        default=Path("experiments/v2_core_rebuild/scoring_v2"),
+        help="the experiment family directory holding <slug>/config.json; only "
+             "consulted when --variant is given")
+    replay.add_argument(
+        "--variant", default=None,
+        help="run a scoring variant instead of the 2.2.0 baseline, e.g. "
+             "s3b-momentum-positive. Sets strategy_version to the variant's "
+             "version, which is what makes it a distinct run_id")
     replay.add_argument("--top", type=int, default=30)
     replay.add_argument("--universe-mode", default="volume",
                         choices=("volume", "static"), dest="universe_mode")
@@ -805,6 +1053,88 @@ def build_parser() -> argparse.ArgumentParser:
                             "report goes to stdout only and the run directory "
                             "is not touched")
     audit.set_defaults(func=_audit)
+
+    # -- experiments -------------------------------------------------------
+    identity = sub.add_parser(
+        "identity", help="re-score a run's ledger and diff against it")
+    identity.add_argument("--run", required=True, type=Path,
+                          help="a run directory: <out>/runs/<run_id>")
+    identity.add_argument("--out", type=Path, default=None,
+                          help="write the report here; the run bundle is never "
+                               "touched")
+    identity.set_defaults(func=_identity)
+
+    # Imported here rather than at module scope to keep this file's lazy-import
+    # discipline; it is only needed to advertise the default.
+    from backtest.experiments.tier0 import PROMOTED_RESIDENCY_CYCLES
+
+    tier0 = sub.add_parser(
+        "tier0", help="slot-aware admission counterfactual (NOT a replay)")
+    tier0.add_argument("--run", required=True, type=Path)
+    tier0.add_argument("--name", required=True,
+                       help="rule name, recorded in the result")
+    tier0.add_argument(
+        "--reject", action="append", default=[], metavar="CLAUSE",
+        help="a rejection clause as comma-separated key=value pairs over "
+             "direction/location/d1_bias, e.g. 'direction=LONG,location=premium'. "
+             "Repeatable; a trade is rejected when any clause matches. With no "
+             "clause the identity rule runs, which is the validation case.")
+    tier0.add_argument(
+        "--promoted-residency", type=int, default=PROMOTED_RESIDENCY_CYCLES,
+        dest="promoted_residency",
+        help="cycles a promoted candidate is assumed to hold its slot; the "
+             "observed median. The one unobservable quantity in the model — vary "
+             "it to see how much a result depends on it.")
+    tier0.add_argument("--out", type=Path, default=None)
+    tier0.set_defaults(func=_tier0)
+
+    phase_a = sub.add_parser(
+        "phase-a", help="Phase A tier-0 studies (A1-A8); no replay")
+    phase_a.add_argument("--run", required=True, type=Path)
+    phase_a.add_argument(
+        "--experiments", type=Path, default=None,
+        help="an experiment programme root, e.g. experiments/v2_core_rebuild; "
+             "its variant_ids are stamped into each result's identity block")
+    phase_a.add_argument(
+        "--out", type=Path, default=None,
+        help="defaults to <run>/analytics/research/results/")
+    phase_a.set_defaults(func=_phase_a)
+
+    anchor = sub.add_parser(
+        "anchor",
+        help="derive quantile-anchored decision thresholds from TRAIN (no replay)")
+    anchor.add_argument("--run", required=True, type=Path)
+    anchor.add_argument(
+        "--root", type=Path,
+        default=Path("experiments/v2_core_rebuild/scoring_v2"),
+        help="the family directory holding <slug>/config.json")
+    anchor.add_argument(
+        "--slug", required=True, nargs="+",
+        help="one or more variant slugs to derive thresholds for")
+    anchor.add_argument(
+        "--role", default="TRAIN", choices=["TRAIN", "DEV"],
+        help="evaluation partition to anchor on; DEV has no promotion authority "
+             "and is offered only for diagnosis")
+    anchor.add_argument(
+        "--apply", action="store_true",
+        help="write the integers into the config. Mints a new variant_id, which "
+             "is why it is opt-in")
+    anchor.add_argument("--out", type=Path, default=None,
+                        help="write the derivation evidence here")
+    anchor.set_defaults(func=_anchor)
+
+    screen = sub.add_parser(
+        "screen",
+        help="tier-0 screen of scoring variants against a volume-matched control")
+    screen.add_argument("--run", required=True, type=Path)
+    screen.add_argument(
+        "--root", type=Path,
+        default=Path("experiments/v2_core_rebuild/scoring_v2"))
+    screen.add_argument("--slug", required=True, nargs="+")
+    screen.add_argument(
+        "--out", type=Path, default=None,
+        help="defaults to <run>/analytics/research/results/")
+    screen.set_defaults(func=_screen)
 
     frozen = sub.add_parser("freeze", help="freeze a run's report as a baseline")
     frozen.add_argument("--run", required=True, type=Path)

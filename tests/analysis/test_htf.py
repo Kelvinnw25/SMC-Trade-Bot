@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.strategy import SMCStrategy
+from tests.regression.v1_recorded import SMCStrategy
 from tests.regression.oracle import V1Oracle
 from tests.regression.snapshot import InputSnapshot
 from v2.analysis.context import AnalysisContext

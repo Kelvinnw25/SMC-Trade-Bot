@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from src.strategy import SMCStrategy
+from tests.regression.v1_recorded import SMCStrategy
 from v2.infra.clock import Clock
 from v2.lifecycle.config import LifecycleConfig
 

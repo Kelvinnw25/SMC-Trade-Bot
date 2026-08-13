@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from tests.regression.observable import ObservableBehavior
-from tests.regression.oracle import (
+from tests.regression.v1_projection import (
     _alert_rank,
     _alert_tier,
     _levels_valid,

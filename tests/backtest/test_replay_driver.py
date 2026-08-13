@@ -757,6 +757,14 @@ class TestProductionUntouched(unittest.TestCase):
             # on it — the wrapper does — and `app -> lifecycle` is already the
             # sanctioned direction, which is why R-6 chose this seam.
             "v2.lifecycle",
+            # The scoring seam. `build_analyzer` already constructs the analyzer
+            # (`v2.analysis.engine` above), and injecting a variant means naming
+            # the pipeline it composes and the config type it accepts. Both are
+            # passed through untouched: `caching.py` reads no weight, no
+            # threshold and no note, and `test_the_driver_defines_no_scoring_or_
+            # lifecycle_rule` below is what keeps it that way. A variant is
+            # resolved from disk in `backtest.experiments`, never here.
+            "v2.analysis.pipeline", "v2.analysis.scoring_config",
         }
         for path in (Path("backtest") / "replay").glob("*.py"):
             for module in imported_modules(path):

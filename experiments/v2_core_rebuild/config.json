@@ -1,0 +1,229 @@
+{
+  "schema": "experiment_program",
+  "schema_version": 1,
+  "program": "v2_core_rebuild",
+  "note": "PROGRAM config. This is NOT an ExperimentConfig - it binds the baseline and lists the variants. Each variant's own config.json under <slug>/ is the hashed ExperimentConfig.",
+  "base_strategy_version": "2.2.0",
+  "executable": false,
+  "blocked_on": "the StrategyConfig seam in v2/analysis does not exist yet; strategy_inputs below specify what it must expose",
+  "baseline": {
+    "run_id": "replay-9ec9cd4487f3ba19",
+    "baseline_id": "baseline-daaf6d3a52eebf54",
+    "baseline_dir": "data/baselines/v2.2.0-official",
+    "metrics_hash": "e7f124530b16437d",
+    "comparison_key_digest": "0880d4d7557d067f",
+    "strategy_version": "2.2.0",
+    "data_snapshot_id": "c8542cb360d13207",
+    "window_start": 1672531200,
+    "window_end": 1782687600,
+    "burn_in_h1": 336,
+    "universe_mode": "volume",
+    "top_coins_limit": 30,
+    "headline": {
+      "population": "admitted scored trades (metrics.json)",
+      "scored_trades": 31209,
+      "total_r": -272.7,
+      "expectancy": -0.0087,
+      "win_rate": 0.322,
+      "max_drawdown_r": 655.8,
+      "recovery_factor": -0.42
+    },
+    "research_population": {
+      "population": "all resolved outcomes incl. slot-suppressed shadows",
+      "n": 92627,
+      "total_r": -2653.4,
+      "expectancy": -0.0286,
+      "sigma_realized_r": 1.667,
+      "note": "3x the admitted population and free of admission selection; resolves 0.031 R where the admitted set resolves 0.053 R"
+    }
+  },
+  "invariants": {
+    "must_not_change": [
+      "data_snapshot_id / the corpus (a rebuild is a different dataset, C-6.10)",
+      "window_start, window_end, burn_in_h1, universe_mode, top_coins_limit (C-5.7.2)",
+      "OutcomeConfig and its hash (segments the dataset, C-4.12)",
+      "requirements.txt (C-19 determinism contract; editing it is a re-baselining event)",
+      "the replay engine, audit system, capture schema and bundle format",
+      "max_open_positions = 10 (the cap binds 51% of cycles and is doing useful selection)",
+      "data/baselines/v2.2.0-official/"
+    ],
+    "must_reverify_per_variant": [
+      "backtest.cli identity --run <baseline> -> 0 mismatches over 886954 ledger rows",
+      "backtest.cli audit --run <baseline> -> PASS, 0 errors",
+      "variant run comparison_key_digest == 0880d4d7557d067f"
+    ]
+  },
+  "variants": [
+    {
+      "slug": "r0-control",
+      "variant_id": "44136fa355b3678a",
+      "tier": 2,
+      "role": "harness validation - must reproduce metrics_hash exactly"
+    },
+    {
+      "slug": "r1-core-cleanup",
+      "variant_id": "67c01d47aa327358",
+      "tier": 2,
+      "role": "noise removal + target cap, entry universe preserved"
+    },
+    {
+      "slug": "r2-selective-continuation",
+      "variant_id": "dc8549addab7f85c",
+      "tier": 2,
+      "role": "R1 + continuation-only + FVG mandatory"
+    },
+    {
+      "slug": "r3-short-asymmetry",
+      "variant_id": "aee5f8e177f418a7",
+      "tier": 2,
+      "role": "R2 + asymmetric LONG qualification"
+    },
+    {
+      "slug": "r3b-short-only",
+      "variant_id": "28b5223358a37639",
+      "tier": 0,
+      "role": "upper bound on any directional rule; never promoted from tier 0"
+    },
+    {
+      "slug": "r3q-quality-filters",
+      "variant_id": "7eb230127fc87ebc",
+      "tier": 0,
+      "role": "falsification arm - predicted to prune, not add edge"
+    }
+  ],
+  "families": {
+    "scoring_v2": {
+      "dir": "experiments/v2_core_rebuild/scoring_v2",
+      "seam_design": "experiments/v2_core_rebuild/seam_design.md",
+      "reference_table": "experiments/v2_core_rebuild/scoring_v2/baseline_scoring.json",
+      "supersedes": "the scoring portion of r1-core-cleanup (variant_id 67c01d47aa327358), whose strategy_inputs assumed all eight zero-information components were bit-neutral to remove. Phase A / A1 showed only the five never-fires components are; the three always-fires components are constants and are now KEPT. r1's target.rr_cap is superseded by B1.",
+      "variants": [
+        {"slug": "s0-control", "variant_id": "44136fa355b3678a", "tier": 0},
+        {"slug": "s1-dead-weights-zero", "variant_id": "af31342b3101d05f", "tier": 0},
+        {"slug": "s2-uninformative-zero", "variant_id": "4d08e5afcc31af0f", "tier": 2, "predecessor_variant_id": "4e24356ef3aa5cfb", "thresholds": "quantile-anchored on TRAIN"},
+        {"slug": "s3a-momentum-zero", "variant_id": "f483fac21274f00d", "tier": 2, "predecessor_variant_id": "a4cf75bcf830bdc6", "thresholds": "quantile-anchored on TRAIN"},
+        {"slug": "s3b-momentum-positive", "variant_id": "fc05024bb0712c2a", "tier": 2, "predecessor_variant_id": "74d9c02b7ed87d38", "thresholds": "quantile-anchored on TRAIN"},
+        {"slug": "s4-fvg-gate", "variant_id": "f4733123554dfba3", "tier": 2},
+        {"slug": "s5-scoring-v2", "variant_id": "9eadd803b9b3b0ec", "tier": 2}
+      ]
+    }
+  },
+  "success_criteria": {
+    "primary": {
+      "expectancy_min_delta_r": 0.015,
+      "expectancy_requires_ci_excluding_zero": true,
+      "total_r_must_exceed_baseline": true,
+      "total_r_must_be_positive": true,
+      "max_drawdown_r_max_worsening_ratio": 1.1,
+      "recovery_factor_min": 1.5,
+      "min_positive_years": 3,
+      "min_positive_years_for_holdout": 4
+    },
+    "secondary_reported_may_veto": [
+      "trade frequency and resulting slot concurrency",
+      "slot utilisation (baseline 51% of cycles at cap)",
+      "alert precision by tier (A+/VALID currently p_adj 0.89 - no information)",
+      "signal distribution by direction / session / year / regime / symbol",
+      "volume-matched control delta (mandatory for r2, r3, r3b, r3q)"
+    ],
+    "explicitly_not_objectives": [
+      "win_rate",
+      "trade_count",
+      "profit_factor_alone"
+    ],
+    "pruning_rule": "a variant whose expectancy rises while total R falls is classified as PRUNING, not edge, and is excluded from replay bundles"
+  },
+  "statistics": {
+    "sigma_realized_r": 1.667,
+    "unpaired_n_for_80pct_power_at_0.05r": 35583,
+    "screening_tiers": [
+      "tier0 (full 92627 population)",
+      "tier1 (paired)"
+    ],
+    "forbidden_screening": "shortened replay windows - a one-year replay resolves only ~0.10 R",
+    "correction": "Holm-Bonferroni within each comparison family; report adjusted p",
+    "result_must_record": [
+      "tier",
+      "n",
+      "sigma",
+      "minimum detectable effect",
+      "control run_id",
+      "comparison_key_digest",
+      "preregistration digest"
+    ]
+  },
+  "holdout": {
+    "status": "DECLARED AS A RULE - snapshot not yet acquired",
+    "rule": {
+      "window": "every boundary strictly after T_n = 1782687600",
+      "snapshot": "to be built at final evaluation time; a forward window is not in any existing snapshot",
+      "snapshot_binding": "holdout.py binds a lock to a data_snapshot_id, so the formal `holdout declare` runs at acquisition. This committed rule plus its commit timestamp is the ordering proof.",
+      "no_tuning_after_declaration": true,
+      "look_budget": 3,
+      "look_allocation": [
+        "the single TRAIN-selected winner",
+        "one corrected implementation if the first look revealed a bug",
+        "reserve"
+      ],
+      "acquire_last": "the forward window grows ~730 cycles/month, so acquiring at programme end yields a larger holdout than acquiring now. Declaration must precede variant runs; acquisition must not."
+    },
+    "rejection_rules": [
+      "holdout expectancy < 0",
+      "holdout expectancy < 25% of TRAIN expectancy",
+      "the sign of the variant's primary factor disagrees with TRAIN",
+      "max drawdown per trade more than 50% worse than TRAIN"
+    ],
+    "comparator": "variant vs control WITHIN the holdout run, not against the frozen baseline. A forward snapshot has a different data_snapshot_id, so ComparisonKey correctly refuses a diff against c8542cb360d13207; a paired in-run control is the valid comparison and also permits a deeper universe for power.",
+    "is_a_gate_not_a_confirmation": {
+      "reason": "sigma(realized_r) = 1.667 R. 80% power for an effect delta needs n = 21.79/delta^2, so +0.040 R needs 13,617 trades and +0.030 R needs 24,208. No window in this corpus can confirm the predicted effects; a small holdout can still refute a large claim.",
+      "consequence": "pre-declare REJECTION thresholds, never promotion ones, and report every holdout result with its own minimum detectable effect"
+    },
+    "void_prior_lock": {
+      "path": "data/research/holdout.lock.json",
+      "binds_snapshot": "15b74e8adc3455e3",
+      "required_snapshot": "c8542cb360d13207",
+      "status": "VOID for this corpus - a holdout binds to a dataset, not a period (holdout.py, C-6.10). Left in place deliberately; not reused, not deleted."
+    },
+    "rejected_alternative": {
+      "window": "2026 H1 on c8542cb360d13207",
+      "why_rejected": [
+        "load-bearing in variant selection: the per-year consistency screen that justifies R1-R3 counted 2026 as one of its four years",
+        "the most favourable period in the corpus - the unmodified baseline already earns +0.0587 R there, so any variant inherits a tailwind",
+        "5-7x too small for the predicted effects",
+        "no embargo against max_holding_h1 = 168 leaking December 2025 entries into January 2026 outcomes"
+      ]
+    }
+  },
+  "partition": {
+    "note": "Evaluation-time roles. No replay is sharded; one unsharded run is sliced.",
+    "TRAIN": {
+      "start": 1672531200,
+      "end": 1751324400,
+      "human": "2023-01-01T00:00Z -> 2025-06-30T23:00Z",
+      "quarters": 10,
+      "authority": "selects the candidate"
+    },
+    "DEV": {
+      "start": 1751328000,
+      "end": 1782687600,
+      "human": "2025-07-01T00:00Z -> 2026-06-28T23:00Z",
+      "authority": "NONE",
+      "why_no_authority": "every Phase 3 study read this period; it is contaminated by prior research and is kept as a labelled diagnostic, not as validation"
+    },
+    "HOLDOUT": {
+      "start": 1782691200,
+      "end": null,
+      "human": "after T_n = 1782687600, i.e. 2026-06-29T00:00Z onward",
+      "authority": "VETO ONLY"
+    },
+    "promotion_test": {
+      "test": "one-sided binomial sign test over TRAIN quarters",
+      "derived_thresholds": "smallest k with p <= 0.05; at 10 slices that is 9 (p=0.0107) with 8 as the flag (p=0.0547)",
+      "promote_at": 9,
+      "flag_at": 8,
+      "reject_at_or_below": 7,
+      "superseded": "the earlier 'positive in 4/4 years' screen could never reach alpha=0.05 - its smallest attainable p is 0.0625",
+      "deciding_comparator": "per-quarter delta vs the VOLUME-MATCHED CONTROL. The absolute test (is the book profitable each quarter) is weak because the baseline loses money in most quarters; the vs-baseline test is passed trivially by any rule that drops the worst trades."
+    }
+  }
+}

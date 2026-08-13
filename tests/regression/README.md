@@ -1,14 +1,35 @@
 # Golden Oracle / Regression Harness
 
-Verification tooling that proves each migration milestone stays **behaviorally
-equivalent to V1**. It is not a trading feature and not part of runtime — nothing
-under `v2/` or `src/` imports it. It exists only to compare V1 and V2 outputs on
-identical, deterministic market inputs (Roadmap §5 "comparison harness", §6
-"golden dataset").
+Verification tooling that proves V2 stays **behaviorally equivalent to V1**. It
+is not a trading feature and not part of runtime — nothing under `v2/` imports
+it. It exists only to compare V1 and V2 outputs on identical, deterministic
+market inputs (Roadmap §5 "comparison harness", §6 "golden dataset").
 
-The migration allows V2 to have a completely different architecture, but **not**
-different observable behavior. This harness is how that rule is enforced,
-milestone by milestone.
+The migration allowed V2 to have a completely different architecture, but **not**
+different observable behavior. This harness is how that rule was enforced,
+milestone by milestone, and how it stays enforced now that the migration is
+complete.
+
+## Since V1 retirement
+
+V1 is no longer executed. `V1Oracle` now answers from **recorded goldens** —
+10,757 captured V1 return values in
+`archive/v1-final/equivalence-proof/goldens/`, replayed through
+`tests/regression/v1_recorded.SMCStrategy`, a drop-in stand-in with V1's exact
+method surface.
+
+Nothing about what is asserted changed. The equivalence tests compare V2 against
+V1's answer for a given input exactly as before; that answer is now looked up
+rather than recomputed. All 2,401 tests pass with V1 absent.
+
+Two consequences worth knowing:
+
+- **`archive/v1-final/equivalence-proof/goldens/` is a live dependency.**
+  Deleting it breaks 146 equivalence tests.
+- **A golden miss is a real signal.** `GoldenMissError` means a test is calling
+  V1 with inputs that were never recorded — usually because the test's inputs
+  changed. Re-record against V1 (restore it from the `v1-final` tag) rather than
+  weakening the assertion. See `v1_recorded.py` for the procedure.
 
 ---
 
@@ -128,8 +149,8 @@ symbol into a dated directory. That directory is a replayable dataset for
 ## How to compare V1 against V2
 
 The comparison engine works on any two analyzers implementing the `Analyzer`
-protocol (`analyze(MarketSnapshot, *, prior=None) -> ObservableBehavior`). Today
-only `V1Oracle` exists; a `V2Analyzer` arrives with Phase 3.
+protocol (`analyze(MarketSnapshot, *, prior=None) -> ObservableBehavior`).
+`V1Oracle` (recorded) and `V2Analyzer` both implement it.
 
 ```python
 from tests.regression.snapshot import InputSnapshot
@@ -165,7 +186,7 @@ per-field PASS/FAIL with the exact path, expected value, actual value, and reaso
 
 ---
 
-## How future milestones use the harness
+## How the milestones used the harness (historical — all complete)
 
 - **Phase 3 (Pure Analysis).** Implement `V2Analyzer(Analyzer)` producing an
   `ObservableBehavior` from a `MarketSnapshot`. For every golden snapshot, assert
@@ -194,12 +215,17 @@ automatically.
 |---|---|
 | `snapshot.py` | `InputSnapshot` — file-backed deterministic input; ↔ `MarketSnapshot`. |
 | `observable.py` | `ObservableBehavior` — the comparison record + `as_field_map()`. |
-| `oracle.py` | `Analyzer` protocol + `V1Oracle` (runs V1's unmodified analysis). |
+| `v1_projection.py` | `Analyzer` protocol + `StrategyOracle` — extracts an `ObservableBehavior` from any V1-shaped strategy. No V1 dependency. |
+| `oracle.py` | `V1Oracle` — binds `StrategyOracle` to the recorded V1. |
+| `v1_recorded.py` | The recorded V1 stand-in: codec, golden store, record/replay. |
 | `compare.py` | Field-level PASS/FAIL engine. |
 | `report.py` | Text rendering of comparison results. |
 | `runner.py` | Comparison workflow + golden capture/replay + `load_snapshots`. |
 | `generate.py` | CLI: `live` capture and `synthetic` fixture builder. |
 | `fixtures/` | Committed deterministic snapshot + its golden field map. |
 | `test_*.py` | Unit tests (no network, no Telegram, temp files only). |
+
+The live-V1 binding this replaced is preserved verbatim at
+`archive/v1-final/tests/oracle_live_v1.py`.
 
 Run the tests: `python -m unittest discover tests` (from the repo root).

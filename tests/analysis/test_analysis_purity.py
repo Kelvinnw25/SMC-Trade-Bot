@@ -24,8 +24,14 @@ ANALYSIS_DIR = Path(__file__).resolve().parents[2] / "v2" / "analysis"
 # domain dependency (MarketSnapshot carries DataFrames) and analysis must read
 # those frames; neither performs I/O nor compromises determinism. Extending this
 # set is a deliberate, reviewable architectural decision — not a routine fix.
+#
+# `types` was added for `MappingProxyType`, which `scoring_config` uses to make
+# the weight tables read-only. It is the type machinery the module docstring
+# already names as allowed, it performs no I/O, and it moves the layer toward
+# immutability rather than away from it.
 ALLOWED_IMPORT_ROOTS = {
-    "__future__", "dataclasses", "typing", "collections", "math", "pandas",
+    "__future__", "dataclasses", "typing", "types", "collections", "math",
+    "pandas",
 }
 ALLOWED_MODULE_PREFIXES = ("v2.domain", "v2.analysis")
 

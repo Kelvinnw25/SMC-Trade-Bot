@@ -2,11 +2,13 @@
 
 Two subcommands:
 
-- ``live``      — fetch one symbol's closed D1/H1(/M5) from the *real* V1 stack
-                  (via the market-data adapter) and save it as an `InputSnapshot`.
-                  This is the documented "generate a snapshot from V1" path. It
-                  performs one network round-trip; it is a manual tool, never run
-                  by the test suite.
+- ``live``      — fetch one symbol's closed D1/H1(/M5) through the market-data
+                  adapter and save it as an `InputSnapshot`. It performs one
+                  network round-trip; it is a manual tool, never run by the test
+                  suite. ``--golden`` writes the reference observable alongside
+                  it; since V1 retirement that reference comes from the recorded
+                  oracle, so it only succeeds for inputs already in the golden
+                  store (see `tests/regression/v1_recorded.py`).
 - ``synthetic`` — (re)build the deterministic, network-free fixture the tests
                   load. `build_synthetic_snapshot` is pure and importable, so the
                   fixture is reproducible and the tests can rebuild it in memory.
@@ -104,10 +106,10 @@ def build_synthetic_snapshot(symbol: str = "SYNTH/USDT") -> InputSnapshot:
 # --------------------------------------------------------------------------
 
 def capture_live_snapshot(symbol: str, *, include_m5: bool = False) -> Optional[InputSnapshot]:
-    """Fetch one closed snapshot from the real V1 stack via the adapter.
+    """Fetch one closed snapshot from the exchange via the market-data adapter.
 
     Imported lazily so the test suite (which never calls this) does not drag in
-    the exchange client. Returns None when V1 has no data for the symbol.
+    the exchange client. Returns None when there is no data for the symbol.
     """
     from datetime import datetime, timezone
 

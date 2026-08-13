@@ -9,7 +9,7 @@ from __future__ import annotations
 import itertools
 import unittest
 
-from src.strategy import SMCStrategy
+from tests.regression.v1_recorded import SMCStrategy
 from v2.lifecycle.config import LifecycleConfig
 from v2.lifecycle.rules import (
     alert_rank,

@@ -1,0 +1,106 @@
+{
+  "schema": "scoring_config_reference",
+  "schema_version": 1,
+  "executable": false,
+  "note": "REFERENCE, not an ExperimentConfig. This is the complete 2.2.0 scoring configuration as ScoringConfig.DEFAULT must expose it. It is not hashed and not a variant: the control is s0-control, whose strategy_inputs are empty (variant_id 44136fa355b3678a). Two objects describing the same behaviour must not both carry a variant id.",
+  "source": "v2/analysis/scoring.py:127-369 (score_signal) and :774-776 (choppy penalty)",
+  "base_strategy_version": "2.2.0",
+  "acceptance": "backtest.cli identity --run replay-9ec9cd4487f3ba19 must report 0 mismatches over 886954 ledger rows with this table loaded as the default.",
+
+  "weights": {
+    "_note": "note name -> score contribution, per entry_mode. A note is the audit record of one term firing, so note names ARE component names; the decomposition in backtest/experiments/rescore.py depends on that identity.",
+    "shared": {
+      "weekly_aligned": 2,
+      "d1_aligned": 2,
+      "h4_aligned": 1,
+      "discount": 2,
+      "premium": 2,
+      "target_clear": 1,
+      "session_active": 1,
+      "htf_context_clean": 1,
+      "expansion": 1,
+      "squeeze": 1,
+      "neutral_penalty": -2,
+      "momentum_weakening": -1
+    },
+    "CONTINUATION": {
+      "weak_volume": -2,
+      "sweep": 1,
+      "fvg": 1,
+      "displacement": 4,
+      "fresh_ob": 1,
+      "m5_continuation_confirm": 1
+    },
+    "RETRACEMENT": {
+      "sweep": 2,
+      "weak_sweep": -1,
+      "fvg": 1,
+      "displacement": 1,
+      "fresh_ob": 2,
+      "no_ob": -1,
+      "m5_choch": 2
+    },
+    "WATCH_ONLY": {
+      "sweep": 1,
+      "fvg": 1,
+      "displacement": 1,
+      "fresh_ob": 1,
+      "m5_watch_confirm": 1
+    }
+  },
+
+  "arms": {
+    "_note": "Components with an else-branch. Both arms are independent notes, so an override that touches one and not the other is legal but is almost always a mistake - zeroing `sweep` while keeping `weak_sweep` leaves a pure penalty with no bonus.",
+    "sweep": ["sweep", "weak_sweep"],
+    "fresh_ob": ["fresh_ob", "no_ob"],
+    "volume_spike": ["weak_volume"]
+  },
+
+  "thresholds": {
+    "CONTINUATION": {"A+": 14, "VALID": 11, "WATCH": 8},
+    "RETRACEMENT": {
+      "A+": 15,
+      "A+_requires": "displacement_valid",
+      "VALID": 12,
+      "VALID_at_A+_score_without_displacement": 15,
+      "WATCH": 9
+    },
+    "WATCH_ONLY": {"WATCH": 12}
+  },
+
+  "rr": {
+    "hard_floor": 1.2,
+    "below_floor_action": "SKIP with reason bad_rr, before any tier is assigned",
+    "bands": [[3.0, 2], [2.0, 1], [1.5, 0]],
+    "band_note": "the 1.5 band emits an rr_ note worth 0 - precedent for scoring a component at weight 0 while keeping its audit trail",
+    "cap": null,
+    "computed_in": "score_signal, from entry_price/sl/tp; stamped onto RiskPlan.rr afterwards"
+  },
+
+  "gates": {
+    "require_fvg": false,
+    "allowed_entry_modes": ["CONTINUATION", "RETRACEMENT", "WATCH_ONLY"],
+    "allowed_directions": ["LONG", "SHORT"],
+    "continuation_requires_entry_source": "continuation_micro_pullback",
+    "watch_only_requires_directional_weekly_and_d1": true
+  },
+
+  "post_scoring": {
+    "choppy_penalty": 2,
+    "choppy_note": "choppy_penalty",
+    "applied_after_tier_assignment": true,
+    "quirk": "the penalty lands on score_signal's SKIP results too, so a bad_rr SKIP in a choppy market publishes score -2"
+  },
+
+  "constants_on_this_corpus": {
+    "_note": "Measured over 373723 scored ledger rows. A constant term cannot change any ranking or any tier while thresholds are unchanged, which is why these are KEPT rather than removed.",
+    "weekly_aligned": "fires on 373720/373723 - direction is derived from weekly_bias, so the term is a tautology",
+    "fresh_ob": "effectively always present",
+    "displacement": "constant in CONTINUATION (the mode gate awards it), variable in RETRACEMENT where it also gates the A+ tier"
+  },
+
+  "never_fires_on_this_corpus": {
+    "_note": "0 occurrences in 373723 scored rows (Phase A / A1). Reachable in code; simply never reached by this data. Zeroing the weight is corpus-safe AND keeps a future firing visible in the notes.",
+    "components": ["discount", "premium", "neutral_penalty", "no_ob", "m5_watch_confirm"]
+  }
+}

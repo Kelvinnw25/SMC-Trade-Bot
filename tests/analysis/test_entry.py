@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.strategy import SMCStrategy
+from tests.regression.v1_recorded import SMCStrategy
 from tests.analysis.test_order_block import (
     build_frame,
     corpus,

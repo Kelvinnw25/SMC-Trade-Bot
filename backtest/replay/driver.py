@@ -429,7 +429,8 @@ class ReplayDriver:
             persistence=persistence,
             notifier=notifier,
             analyzer=build_analyzer(caching=config.caching_analyzer,
-                                    data_snapshot_id=self.data_snapshot_id),
+                                    data_snapshot_id=self.data_snapshot_id,
+                                    scoring_config=config.scoring_config),
             config=config.lifecycle_config,
             top_coins_limit=config.top_coins_limit,
             # C-15.2 / R-6: the one production seam capture uses — the injection

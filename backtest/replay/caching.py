@@ -76,6 +76,8 @@ from collections import Counter, OrderedDict
 from typing import Any, Optional
 
 from v2.analysis.engine import V2Analyzer
+from v2.analysis.pipeline import AnalysisPipeline
+from v2.analysis.scoring_config import DEFAULT_SCORING_CONFIG, ScoringConfig
 
 # `AnalysisContext` is deliberately **not** imported. `test_replay_driver.
 # test_the_driver_contains_no_strategy_logic` holds `backtest/replay/` to a closed
@@ -301,8 +303,21 @@ class CachingAnalyzer:
             snapshot, prior=prior, session_active=session_active)
 
 
-def build_analyzer(*, caching: bool, data_snapshot_id: str = ""):
-    """The driver's one-line selection, extracted so it is directly testable."""
+def build_analyzer(*, caching: bool, data_snapshot_id: str = "",
+                   scoring_config: ScoringConfig = DEFAULT_SCORING_CONFIG):
+    """The driver's one-line selection, extracted so it is directly testable.
+
+    `scoring_config` is the replay end of the `ScoringConfig` seam. It defaults to
+    `DEFAULT_SCORING_CONFIG`, so every existing caller keeps producing 2.2.0.
+
+    The pipeline is built explicitly in both arms rather than only in the caching
+    one. `CachingAnalyzer()` with no inner analyzer constructs its own
+    `V2Analyzer()` — and therefore its own default pipeline — so passing the
+    config to one arm and not the other would make `--caching` silently decide
+    whether a variant took effect. That is precisely the class of bug the flag is
+    documented as being unable to cause.
+    """
+    inner = V2Analyzer(AnalysisPipeline.default(scoring_config))
     if caching:
-        return CachingAnalyzer(data_snapshot_id=data_snapshot_id)
-    return V2Analyzer()
+        return CachingAnalyzer(inner, data_snapshot_id=data_snapshot_id)
+    return inner

@@ -62,13 +62,18 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
 
 from v2.analysis.context import AnalysisContext
 from v2.analysis.frames import H1_MIN_ROWS, safe_frame
 from v2.analysis.order_block import fresh_ob
+from v2.analysis.scoring_config import (
+    DEFAULT_SCORING_CONFIG,
+    ScoreAccumulator,
+    ScoringConfig,
+)
 from v2.analysis.structure import identify_swings
 from v2.domain import (
     FairValueGap,
@@ -78,6 +83,12 @@ from v2.domain import (
     Signal,
     SignalCandidate,
 )
+
+#: The post-scoring choppy note, and the mode that is scored even when the entry
+#: is not ready. Both are recorded ledger values, not tunables — see
+#: `scoring_config` ("Reasons and note names are schema, not parameters").
+CHOPPY_NOTE = "choppy_penalty"
+WATCH_ONLY_MODE = "WATCH_ONLY"
 
 # V1 M5 gate + swing parameters (strategy.py:1825, 1837).
 _M5_MIN_ROWS = 6
@@ -129,21 +140,26 @@ def score_signal(
     regime: str,
     h1_setup: Dict[str, Any],
     m5_setup: Optional[Dict[str, Any]] = None,
+    *,
+    config: ScoringConfig = DEFAULT_SCORING_CONFIG,
 ) -> Dict[str, Any]:
     if not htf_map or not h1_setup:
         return {"score": 0, "decision": "SKIP", "reason": "missing_input"}
 
-    score = 0
-    notes: List[str] = []
-
     direction = str(h1_setup.get("direction", "")).upper().strip()
-    entry_mode = str(h1_setup.get("entry_mode", "RETRACEMENT")).upper().strip()
+    entry_mode = str(
+        h1_setup.get("entry_mode", config.default_entry_mode)).upper().strip()
 
-    if direction not in {"LONG", "SHORT"}:
+    if direction not in config.directions:
         return {"score": 0, "decision": "SKIP", "reason": "missing_direction"}
 
-    if entry_mode not in {"CONTINUATION", "RETRACEMENT", "WATCH_ONLY"}:
-        entry_mode = "RETRACEMENT"
+    if entry_mode not in config.entry_modes:
+        entry_mode = config.default_entry_mode
+
+    # `notes` and `score` move together from here on: every scored term appends
+    # exactly one note, which is what makes a recorded `notes` list decomposable.
+    acc = ScoreAccumulator(config.weights_for(entry_mode))
+    notes = acc.notes
 
     displacement_present = bool(h1_setup.get("displacement_valid", False))
     volume_spike = bool(h1_setup.get("volume_spike", False))
@@ -153,7 +169,7 @@ def score_signal(
 
     # -- MODE-AWARE GATES --
     if entry_mode == "CONTINUATION":
-        if str(h1_setup.get("entry_source", "")) != "continuation_micro_pullback":
+        if str(h1_setup.get("entry_source", "")) != config.continuation_entry_source:
             return {
                 "score": 0,
                 "decision": "SKIP",
@@ -161,12 +177,11 @@ def score_signal(
                 "entry_mode": entry_mode,
             }
         if not volume_spike:
-            score -= 2
-            notes.append("weak_volume")
+            acc.award("weak_volume")
     elif entry_mode == "WATCH_ONLY":
         if not (
-            htf_map.get("weekly_bias") in {"BULLISH", "BEARISH"}
-            and htf_map.get("d1_bias") in {"BULLISH", "BEARISH"}
+            htf_map.get("weekly_bias") in config.directional_biases
+            and htf_map.get("d1_bias") in config.directional_biases
         ):
             return {
                 "score": 0,
@@ -177,100 +192,74 @@ def score_signal(
 
     # -- HTF ALIGNMENT --
     if direction == "LONG":
-        if htf_map.get("weekly_bias") == "BULLISH":
-            score += 2
-            notes.append("weekly_aligned")
-        if htf_map.get("d1_bias") == "BULLISH":
-            score += 2
-            notes.append("d1_aligned")
-        if htf_map.get("h4_bias") == "BULLISH":
-            score += 1
-            notes.append("h4_aligned")
-        if htf_map.get("location") == "discount":
-            score += 2
-            notes.append("discount")
+        aligned = config.alignment["LONG"]
+        if htf_map.get("weekly_bias") == aligned["bias"]:
+            acc.award("weekly_aligned")
+        if htf_map.get("d1_bias") == aligned["bias"]:
+            acc.award("d1_aligned")
+        if htf_map.get("h4_bias") == aligned["bias"]:
+            acc.award("h4_aligned")
+        if htf_map.get("location") == aligned["location"]:
+            acc.award("discount")
     elif direction == "SHORT":
-        if htf_map.get("weekly_bias") == "BEARISH":
-            score += 2
-            notes.append("weekly_aligned")
-        if htf_map.get("d1_bias") == "BEARISH":
-            score += 2
-            notes.append("d1_aligned")
-        if htf_map.get("h4_bias") == "BEARISH":
-            score += 1
-            notes.append("h4_aligned")
-        if htf_map.get("location") == "premium":
-            score += 2
-            notes.append("premium")
+        aligned = config.alignment["SHORT"]
+        if htf_map.get("weekly_bias") == aligned["bias"]:
+            acc.award("weekly_aligned")
+        if htf_map.get("d1_bias") == aligned["bias"]:
+            acc.award("d1_aligned")
+        if htf_map.get("h4_bias") == aligned["bias"]:
+            acc.award("h4_aligned")
+        if htf_map.get("location") == aligned["location"]:
+            acc.award("premium")
 
     # -- CORE CONFIRMATIONS --
     if entry_mode == "CONTINUATION":
         if sweep_present:
-            score += 1
-            notes.append("sweep")
+            acc.award("sweep")
         if fvg_present:
-            score += 1
-            notes.append("fvg")
-        if str(h1_setup.get("entry_source", "")) == "continuation_micro_pullback":
-            score += 4
-            notes.append("displacement")
+            acc.award("fvg")
+        if str(h1_setup.get("entry_source", "")) == config.continuation_entry_source:
+            acc.award("displacement")
         if ob_present:
-            score += 1
-            notes.append("fresh_ob")
+            acc.award("fresh_ob")
     elif entry_mode == "RETRACEMENT":
         if sweep_present:
-            score += 2
-            notes.append("sweep")
+            acc.award("sweep")
         else:
-            score -= 1
-            notes.append("weak_sweep")
+            acc.award("weak_sweep")
         if fvg_present:
-            score += 1
-            notes.append("fvg")
+            acc.award("fvg")
         if displacement_present:
-            score += 1
-            notes.append("displacement")
+            acc.award("displacement")
         if ob_present:
-            score += 2
-            notes.append("fresh_ob")
+            acc.award("fresh_ob")
         else:
-            score -= 1
-            notes.append("no_ob")
+            acc.award("no_ob")
     else:  # WATCH_ONLY
         if sweep_present:
-            score += 1
-            notes.append("sweep")
+            acc.award("sweep")
         if fvg_present:
-            score += 1
-            notes.append("fvg")
+            acc.award("fvg")
         if displacement_present:
-            score += 1
-            notes.append("displacement")
+            acc.award("displacement")
         if ob_present:
-            score += 1
-            notes.append("fresh_ob")
+            acc.award("fresh_ob")
 
     # -- STRUCTURE QUALITY --
     if h1_setup.get("target_clear", False):
-        score += 1
-        notes.append("target_clear")
+        acc.award("target_clear")
     if h1_setup.get("session_active", False):
-        score += 1
-        notes.append("session_active")
+        acc.award("session_active")
     if h1_setup.get("htf_context_clean", False):
-        score += 1
-        notes.append("htf_context_clean")
+        acc.award("htf_context_clean")
 
     # -- REGIME ENGINE --
-    if regime in {"expansion_up", "expansion_down"}:
-        score += 1
-        notes.append("expansion")
-    elif regime in {"accumulation", "distribution"}:
-        score += 1
-        notes.append("squeeze")
-    elif regime in {"neutral", "compression", "unknown"}:
-        score -= 2
-        notes.append("neutral_penalty")
+    if regime in config.expansion_regimes:
+        acc.award("expansion")
+    elif regime in config.squeeze_regimes:
+        acc.award("squeeze")
+    elif regime in config.penalty_regimes:
+        acc.award("neutral_penalty")
 
     # -- RR ENGINE --
     entry = h1_setup.get("entry_price")
@@ -290,7 +279,7 @@ def score_signal(
             if math.isfinite(risk) and math.isfinite(reward) and risk > 0:
                 rr = reward / risk
 
-                if rr < 1.2:
+                if rr < config.rr_floor:
                     return {
                         "score": 0,
                         "decision": "SKIP",
@@ -299,63 +288,34 @@ def score_signal(
                         "entry_mode": entry_mode,
                     }
 
-                if rr >= 3.0:
-                    score += 2
-                    notes.append(f"rr_{rr:.1f}")
-                elif rr >= 2.0:
-                    score += 1
-                    notes.append(f"rr_{rr:.1f}")
-                elif rr >= 1.5:
-                    notes.append(f"rr_{rr:.1f}")
+                # The band's weight comes from the band, not the weight table:
+                # the note text carries the value. `None` means no band matched
+                # and no note is appended — distinct from a band worth 0, which
+                # appends the note and adds nothing.
+                band = config.rr_band_weight(rr)
+                if band is not None:
+                    acc.add(band, f"rr_{rr:.1f}")
         except Exception:
             pass
 
     # -- MOMENTUM QUALITY --
     if htf_map.get("momentum_weakening", False):
-        score -= 1
-        notes.append("momentum_weakening")
+        acc.award("momentum_weakening")
 
     # -- M5 ENRICHMENT --
     if m5_setup and m5_setup.get("choch_confirmed", False):
         if entry_mode == "CONTINUATION":
-            score += 1
-            notes.append("m5_continuation_confirm")
+            acc.award("m5_continuation_confirm")
         elif entry_mode == "RETRACEMENT":
-            score += 2
-            notes.append("m5_choch")
+            acc.award("m5_choch")
         else:
-            score += 1
-            notes.append("m5_watch_confirm")
+            acc.award("m5_watch_confirm")
 
     # -- FINAL DECISION --
-    if entry_mode == "CONTINUATION":
-        if score >= 14:
-            decision = "A+"
-        elif score >= 11:
-            decision = "VALID"
-        elif score >= 8:
-            decision = "WATCH"
-        else:
-            decision = "SKIP"
-    elif entry_mode == "RETRACEMENT":
-        if score >= 15 and displacement_present:
-            decision = "A+"
-        elif score >= 15 and not displacement_present:
-            decision = "VALID"
-        elif score >= 12:
-            decision = "VALID"
-        elif score >= 9:
-            decision = "WATCH"
-        else:
-            decision = "SKIP"
-    else:  # WATCH_ONLY
-        if score >= 12:
-            decision = "WATCH"
-        else:
-            decision = "SKIP"
+    decision = config.decide(entry_mode, acc.score, displacement_present)
 
     return {
-        "score": int(score),
+        "score": int(acc.score),
         "decision": decision,
         "direction": direction,
         "notes": notes,
@@ -652,6 +612,7 @@ def enrich_with_m5(
     m5_df: Optional[pd.DataFrame],
     *,
     session_active: bool,
+    config: ScoringConfig = DEFAULT_SCORING_CONFIG,
 ) -> Signal:
     """V1 `enrich_with_m5` (strategy.py:1809-1959), verbatim behavior.
 
@@ -675,9 +636,10 @@ def enrich_with_m5(
 
     htf, regime = candidate.htf, candidate.regime
     direction = str(candidate.htf.direction or "").upper().strip()
-    entry_mode = str(candidate.entry.entry_mode or "RETRACEMENT").upper().strip()
+    entry_mode = str(
+        candidate.entry.entry_mode or config.default_entry_mode).upper().strip()
 
-    if direction not in {"LONG", "SHORT"}:
+    if direction not in config.directions:
         return base_signal
 
     m5_setup = _m5_setup(direction, entry_mode, m5, session_active=session_active)
@@ -685,12 +647,13 @@ def enrich_with_m5(
     # V1 reconstructs its h1_setup from the context; the candidate carries the
     # identical inputs, so the re-score sees the same values plus m5_setup.
     h1_setup = _candidate_h1_setup(candidate)
-    result = dict(score_signal(_htf_map(htf), regime.label, h1_setup, m5_setup))
+    result = dict(score_signal(
+        _htf_map(htf), regime.label, h1_setup, m5_setup, config=config))
 
     # V1 re-applies the choppy penalty from the base result's notes (1946-1948).
-    if "choppy_penalty" in base_signal.notes:
-        result["score"] = int(result.get("score", 0)) - 2
-        result.setdefault("notes", []).append("choppy_penalty")
+    if CHOPPY_NOTE in base_signal.notes:
+        result["score"] = int(result.get("score", 0)) - config.choppy_penalty
+        result.setdefault("notes", []).append(CHOPPY_NOTE)
 
     result.update(
         {
@@ -714,9 +677,19 @@ def enrich_with_m5(
 # ==========================================================================
 
 class ScoringStage:
-    """Scores the setup, assigns the decision tier, and emits the Signal."""
+    """Scores the setup, assigns the decision tier, and emits the Signal.
+
+    `config` is the scoring seam: the stage holds the `ScoringConfig` the whole
+    analysis runs under, and `AnalysisPipeline.scoring_config` reads it back off
+    the stage so the M5 re-score cannot drift from the pipeline. Defaulting to
+    `DEFAULT_SCORING_CONFIG` keeps every existing caller — `ScoringStage()` —
+    working unchanged and producing 2.2.0 behaviour.
+    """
 
     name = "scoring"
+
+    def __init__(self, config: ScoringConfig = DEFAULT_SCORING_CONFIG) -> None:
+        self.config = config
 
     def run(self, context: AnalysisContext) -> AnalysisContext:
         symbol = context.snapshot.symbol
@@ -754,7 +727,7 @@ class ScoringStage:
         entry = context.entry
 
         # -- not-ready exit (1716-1730): precedes scoring, no result.update --
-        if not entry.entry_ready and entry.entry_mode != "WATCH_ONLY":
+        if not entry.entry_ready and entry.entry_mode != WATCH_ONLY_MODE:
             candidate = _candidate(context, h1_setup)
             signal = Signal(
                 symbol=symbol,
@@ -769,11 +742,12 @@ class ScoringStage:
             return context.with_(candidate=candidate, signal=signal)
 
         # -- score + choppy penalty + result.update (1732-1782) --
-        result = dict(score_signal(_htf_map(htf), regime_label, h1_setup, None))
+        result = dict(score_signal(
+            _htf_map(htf), regime_label, h1_setup, None, config=self.config))
 
         if is_market_choppy(h1):
-            result["score"] = int(result.get("score", 0)) - 2
-            result.setdefault("notes", []).append("choppy_penalty")
+            result["score"] = int(result.get("score", 0)) - self.config.choppy_penalty
+            result.setdefault("notes", []).append(CHOPPY_NOTE)
 
         candidate = _finalize_candidate(context, result.get("rr"), h1_setup)
         signal = _signal_from_result(symbol, result, htf, regime, candidate)

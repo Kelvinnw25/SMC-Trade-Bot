@@ -128,6 +128,10 @@ class RunLineage:
     window_start: Optional[int] = None
     window_end: Optional[int] = None
     data_snapshot_id: Optional[str] = None
+    #: `ComparisonKey` carries it (two runs over different universe depths are not
+    #: the same experiment), and like the rest of this class it is read from `core`
+    #: rather than defaulted — an undeclared limit stays None.
+    top_coins_limit: Optional[int] = None
 
     @property
     def declared(self) -> bool:
@@ -141,6 +145,7 @@ class RunLineage:
             "window_start": self.window_start,
             "window_end": self.window_end,
             "data_snapshot_id": self.data_snapshot_id,
+            "top_coins_limit": self.top_coins_limit,
         }
 
 
@@ -168,6 +173,7 @@ def read_run_lineage(run_dir: Path | str) -> RunLineage:
         window_start=_opt_int(core.get("T_0")),
         window_end=_opt_int(core.get("T_n")),
         data_snapshot_id=_opt_str(core.get("data_snapshot_id")),
+        top_coins_limit=_opt_int(core.get("top_coins_limit")),
     )
 
 
