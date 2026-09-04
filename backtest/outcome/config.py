@@ -15,7 +15,7 @@ in code could not do that.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Optional
 
 from backtest.data.repository import canonical_json
 from backtest.outcome.errors import OutcomeConfigError
@@ -56,6 +56,11 @@ class OutcomeConfig:
     burn_in_h1: int = 336
     #: Fixed: per-trade unit for the drawdown curve (C-9.8).
     equity_convention: str = "1R"
+    #: The committed `exchangeInfo` artifact supplying `tickSize` for C-4.14's
+    #: sub-tick floor, or `None` to leave the floor unevaluated. Named here
+    #: rather than resolved in code precisely so the choice of price grid
+    #: segments every dataset derived under it — see `backtest.outcome.ticks`.
+    tick_reference: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.max_holding_h1 < 1:
@@ -91,6 +96,11 @@ class OutcomeConfig:
         if self.burn_in_h1 < 0:
             raise OutcomeConfigError(
                 f"burn_in_h1 must be >= 0, got {self.burn_in_h1}")
+        if self.tick_reference is not None and not str(self.tick_reference):
+            raise OutcomeConfigError(
+                "tick_reference must be a non-empty artifact id or None; an "
+                "empty string would hash differently from None while meaning "
+                "the same thing")
         for name in ("taker_fee_rate", "slippage_rate"):
             value = getattr(self, name)
             if value < 0:

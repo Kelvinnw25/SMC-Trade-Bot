@@ -56,8 +56,10 @@ from backtest.data.repository import (
 )
 from backtest.outcome.config import OutcomeConfig
 from backtest.outcome.errors import OutcomeDataError
+from backtest.outcome.ticks import TickTable
 from backtest.outcome.trade import (
-    Cancellation, STATE_ACTIVE, STATE_EXPIRED, STATE_INVALIDATED_EXIT,
+    Cancellation, REJECT_STOP_REACHED_AT_FILL, REJECT_SUB_TICK_RISK,
+    STATE_ACTIVE, STATE_EXPIRED, STATE_INVALIDATED_EXIT,
     STATE_INVALID_LEVELS, STATE_LOSS, STATE_NOT_FILLED, STATE_PENDING,
     STATE_WIN, TradeIntent,
 )
@@ -109,6 +111,8 @@ class Resolution:
     mfe_r: Optional[float] = None
     excursion_degraded: bool = False
     structural_rr: Optional[float] = None
+    #: C-4.14: the sub-tick floor could not be evaluated for this symbol.
+    tick_size_unavailable: bool = False
 
 
 @dataclass(frozen=True)
@@ -130,23 +134,35 @@ def resolve_walk(
     repository: KlineRepository,
     config: OutcomeConfig,
     counters: WalkCounters,
+    ticks: Optional[TickTable] = None,
 ) -> Resolution:
-    """Resolve one trade against stored prices."""
-    return _Walk(intent, repository, config, counters).run()
+    """Resolve one trade against stored prices.
+
+    `ticks` supplies C-4.14's price grid. `None` leaves the sub-tick floor
+    unevaluated for every symbol, which is what an engine built without
+    `tick_reference` does.
+    """
+    return _Walk(intent, repository, config, counters, ticks).run()
 
 
 class _Walk:
     def __init__(self, intent: TradeIntent, repository: KlineRepository,
-                 config: OutcomeConfig, counters: WalkCounters) -> None:
+                 config: OutcomeConfig, counters: WalkCounters,
+                 ticks: Optional[TickTable] = None) -> None:
         self._intent = intent
         self._repo = repository
         self._config = config
         self._counters = counters
+        self._ticks = ticks
         self._native = intent.native_symbol
         self._long = intent.is_long
         self._sl = float(intent.sl)
         self._tp = float(intent.tp)
         self._entry = float(intent.entry_price)
+        #: Set by `_admissible_fill` when the walk itself refuses to fill; read
+        #: by `run` so the refusal is reported instead of a lifecycle cancel.
+        self._reject: Optional[str] = None
+        self._tick_unavailable = False
 
     # -- entry point -------------------------------------------------------
 
@@ -160,10 +176,22 @@ class _Walk:
 
         fill = self._find_fill(cancel, data_end_open)
         if fill is None:
+            if self._reject is not None:
+                # C-4.1 / C-4.14: the walk refused the fill. This outranks a
+                # lifecycle cancellation because the refusal happens at the
+                # execution instant, and C-4.13 already put every candle that
+                # could still fill *before* the cancellation deadline — a
+                # cancellation that beat the fill would have left `_reject`
+                # unset, because the candle was never evaluated.
+                return Resolution(
+                    state=STATE_NOT_FILLED, cancel_reason=self._reject,
+                    exit_T=self._intent.boundary, structural_rr=structural_rr,
+                    tick_size_unavailable=self._tick_unavailable)
             if cancel is not None:
                 return Resolution(
                     state=STATE_NOT_FILLED, cancel_reason=cancel.reason,
-                    exit_T=cancel.boundary, structural_rr=structural_rr)
+                    exit_T=cancel.boundary, structural_rr=structural_rr,
+                    tick_size_unavailable=self._tick_unavailable)
             # Data ran out with the order still resting: the `OPEN` label (C-4.10).
             return Resolution(
                 state=STATE_PENDING, exit_reason="END_OF_DATA",
@@ -177,7 +205,8 @@ class _Walk:
                               fill_kind=fill_kind, fill_T=fill_open,
                               fill_price=fill_price,
                               candles_to_fill=self._candle_index(fill_open),
-                              structural_rr=structural_rr)
+                              structural_rr=structural_rr,
+                              tick_size_unavailable=self._tick_unavailable)
 
         exit_event, segments, degraded = self._find_exit(
             fill_open, fill_price, fill_kind, data_end_open)
@@ -205,6 +234,7 @@ class _Walk:
             mfe_r=mfe_r,
             excursion_degraded=degraded,
             structural_rr=structural_rr,
+            tick_size_unavailable=self._tick_unavailable,
         )
 
     # -- C-4.14 level sanity ----------------------------------------------
@@ -262,20 +292,71 @@ class _Walk:
                 return None
             price = (float(origin["open"]) if self._config.continuation_fill
                      == "w0_open" else float(origin["close"]))
+            if not self._admissible_fill(price, market=True):
+                return None
             return self._intent.boundary, price, "MARKET_WALK_ORIGIN"
 
         if self._pre_crossed():
             origin = candles[0]
             if int(origin["timestamp"]) // 1000 != self._intent.boundary:
                 return None
-            return self._intent.boundary, float(origin["open"]), "IMMEDIATE"
+            price = float(origin["open"])
+            if not self._admissible_fill(price, market=False):
+                return None
+            return self._intent.boundary, price, "IMMEDIATE"
 
         for candle in candles:
             open_time = int(candle["timestamp"]) // 1000
             price, kind = self._limit_fill(candle)
             if price is not None:
+                if not self._admissible_fill(price, market=False):
+                    return None
                 return open_time, price, kind        # type: ignore[return-value]
         return None
+
+    # -- fill admissibility (C-4.1 crossed stop, C-4.14 tick floor) --------
+
+    def _admissible_fill(self, price: float, *, market: bool) -> bool:
+        """Whether a price the fill rules produced could have been traded.
+
+        Two refusals, both about the order rather than the levels — which stay
+        internally sound, so `INVALID_LEVELS` is not the right terminal state:
+
+        **Crossed stop (C-4.1).** R-10 already refuses to model patience for a
+        limit resting at or through market. A CONTINUATION fills at market at
+        `open(W0)`, which *is* the decision instant, so the same principle
+        applies: if the market has already reached the stop there is no trade to
+        place. `_pre_crossed` gives RETRACEMENT this protection against `C_ref`
+        and is untouched; `market=True` extends it to the market branch, which
+        had no equivalent. Equality is inadmissible — a stop exactly at the fill
+        has no risk unit at all, which C-9.6 already refuses one line later.
+
+        **Sub-tick risk (C-4.14).** A stop nearer the fill than one increment of
+        the exchange's price grid is not a small risk but an unrepresentable
+        one. Exactly one tick is admissible. Applied to every fill kind, because
+        representability is a property of the price grid and not of how the
+        order was routed; no RETRACEMENT fill in the frozen corpus is affected.
+        A symbol missing from the reference leaves the floor unevaluated and
+        flags the record rather than guessing a tick.
+        """
+        if market:
+            # A LONG stops out *below* its fill and a SHORT *above* it
+            # (`_levels_sane` enforces `tp > entry > sl` / `tp < entry < sl`),
+            # so the stop has already been reached when the market fill is at
+            # or past it on that side.
+            crossed = price <= self._sl if self._long else price >= self._sl
+            if crossed:
+                self._reject = REJECT_STOP_REACHED_AT_FILL
+                return False
+
+        tick = None if self._ticks is None else self._ticks.tick_for(self._native)
+        if tick is None:
+            self._tick_unavailable = True
+            return True
+        if abs(price - self._sl) < tick:
+            self._reject = REJECT_SUB_TICK_RISK
+            return False
+        return True
 
     def _pre_crossed(self) -> bool:
         """C-4.1: a limit already at or through market fills at once.

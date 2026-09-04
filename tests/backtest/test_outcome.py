@@ -659,7 +659,7 @@ class TestRecord(OutcomeCase):
         record = engine.resolve(self.intent())
         self.assertEqual(record.contract_version, "1.1")
         self.assertEqual(record.ledger_schema_version, 2)
-        self.assertEqual(record.outcome_schema_version, 2)
+        self.assertEqual(record.outcome_schema_version, 3)
         self.assertEqual(record.outcome_config_hash, engine.config_hash)
         self.assertIn("pandas_ta", record.env)
         self.assertTrue(record.data_snapshot_id)
@@ -784,7 +784,7 @@ class TestConfig(unittest.TestCase):
             "max_holding_h1", "continuation_fill", "limit_fill_rule",
             "tie_break", "no_m5_policy", "taker_fee_rate", "slippage_rate",
             "funding_rate_model", "shadow_pending_h1", "burn_in_h1",
-            "equity_convention"})
+            "equity_convention", "tick_reference"})
 
     def test_the_defaults_are_the_contract_defaults(self):
         config = OutcomeConfig()
@@ -878,6 +878,10 @@ class TestBoundaries(unittest.TestCase):
             "backtest.outcome.config", "backtest.outcome.errors",
             "backtest.outcome.record", "backtest.outcome.trade",
             "backtest.outcome.walker", "backtest.outcome.engine",
+            # C-4.14's price grid: a leaf reading one committed exchangeInfo
+            # artifact, importing nothing beyond stdlib and this package's own
+            # errors, so the §10 layering is unchanged by its presence.
+            "backtest.outcome.ticks",
             "v2.app.ledger", "v2.domain.signal_ledger",
         }
         for path in self.OUTCOME.glob("*.py"):
@@ -1076,7 +1080,7 @@ class TestRunLineage(OutcomeCase):
 
     def test_the_schema_version_records_that_the_field_set_changed(self):
         record = self.resolve(self.WALK)
-        self.assertEqual(record.outcome_schema_version, 2)
+        self.assertEqual(record.outcome_schema_version, 3)
 
 
 if __name__ == "__main__":

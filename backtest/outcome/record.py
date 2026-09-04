@@ -30,7 +30,17 @@ __all__ = ["OUTCOME_SCHEMA_VERSION", "OutcomeRecord"]
 #: reader rejects unknown keys rather than dropping columns silently
 #: (`backtest.dataset.read_outcomes`). A strict reader is the right choice for an
 #: evaluation dataset, and the cost of that choice is this version bump.
-OUTCOME_SCHEMA_VERSION = 2
+#:
+#: **3 (market-fill admissibility):** `tick_size_unavailable` added to the fill
+#: group. C-4.14's sub-tick floor cannot be evaluated for a symbol absent from
+#: the reference `exchangeInfo` snapshot, and the eleven such symbols in the
+#: frozen corpus were delisted before any snapshot exists to hold them. The flag
+#: says *the floor did not run here* — as distinct from *the floor ran and the
+#: fill passed* — because a reader cannot otherwise tell those apart, and the
+#: difference is exactly what a later historical tick source would change.
+#: Backward compatible in the same way `burn_in_h1` was: a schema-2 line parses
+#: with the field defaulting to `False`.
+OUTCOME_SCHEMA_VERSION = 3
 
 #: `|realized_r| < BREAKEVEN_R` is the derived break-even bucket (C-3.1).
 BREAKEVEN_R = 0.1
@@ -124,6 +134,12 @@ class OutcomeRecord:
     #: The ledger's own signal id, carried through so a record joins back to the
     #: row it came from without re-deriving the canonical key of C-9.4.
     signal_id: Optional[str] = None
+
+    #: C-4.14: the symbol was absent from the configured tick reference, so the
+    #: sub-tick floor was **not evaluated** for this record. The crossed-stop
+    #: guard still ran — it needs no market metadata. `False` on every record
+    #: whose floor was evaluated, including every rejected one.
+    tick_size_unavailable: bool = False
 
     # -- derived reporting labels (never stored) ---------------------------
 

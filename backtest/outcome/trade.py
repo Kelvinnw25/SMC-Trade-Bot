@@ -43,6 +43,10 @@ __all__ = [
     "ENTRY_MODES",
     "EXIT_REASONS",
     "FILL_KINDS",
+    "FILL_REJECT_REASONS",
+    "NOT_FILLED_REASONS",
+    "REJECT_STOP_REACHED_AT_FILL",
+    "REJECT_SUB_TICK_RISK",
     "SHADOW_KINDS",
     "STATE_ACTIVE",
     "STATE_EXPIRED",
@@ -75,10 +79,31 @@ TERMINAL_STATES = frozenset({
     STATE_EXPIRED, STATE_INVALID_LEVELS,
 })
 
-#: C-3.1: `NOT_FILLED` always carries one of these.
+#: C-3.1: the lifecycle events that can end a *pending* trade (C-4.8). A
+#: `Cancellation` must name one of these; they all originate outside the walk.
 CANCEL_REASONS = frozenset({
     "KILL", "DECAY", "TTL", "REPLACED", "SUPERSEDED", "SHADOW_WINDOW",
 })
+
+#: C-4.1 / C-4.14: the walk's own refusals to fill. Categorically **not**
+#: cancellations — no lifecycle event occurred; the order was never placeable at
+#: the execution instant. They share `NOT_FILLED` and the `cancel_reason` column
+#: because that is where the contract records "why this decision never became a
+#: trade", and they are kept distinct from each other so a study can segment the
+#: crossed stop from the unrepresentable one.
+#:
+#: `INVALID_LEVELS` is deliberately not reused: the levels are internally sound
+#: in both cases (C-4.14 continues to own genuinely impossible geometry), and
+#: what fails is admissibility of the *fill*, not of the decision.
+REJECT_STOP_REACHED_AT_FILL = "STOP_REACHED_AT_FILL"
+REJECT_SUB_TICK_RISK = "SUB_TICK_RISK"
+
+FILL_REJECT_REASONS = frozenset({
+    REJECT_STOP_REACHED_AT_FILL, REJECT_SUB_TICK_RISK,
+})
+
+#: Everything `NOT_FILLED` can carry, from either origin.
+NOT_FILLED_REASONS = CANCEL_REASONS | FILL_REJECT_REASONS
 
 #: C-4.1 / C-4.2.
 FILL_KINDS = frozenset({

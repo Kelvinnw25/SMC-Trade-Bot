@@ -149,6 +149,7 @@ _OUTCOME_FIELDS = {f.name for f in fields(OutcomeRecord)}
 #: `metrics.freeze()`, where the consequence is understood.
 _OPTIONAL_FIELDS = frozenset({
     "signal_id", "env", "burn_in_h1", "universe_mode",
+    "tick_size_unavailable",
 })
 
 

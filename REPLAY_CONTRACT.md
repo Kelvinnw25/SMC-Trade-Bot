@@ -34,6 +34,7 @@
 | **C-4.0, C-4.1, C-4.2, C-4.3, C-4.10, C-4.14** | New/amended: walk origin, pre-crossed limits, continuation fill target, missing-M5 fallback, expiry counting, level sanity gate. | D-4 |
 | **C-2.2, C-9.6, C-9.7, C-9.8** | New/amended: three explicit shadow classes; R arithmetic; canonical `OutcomeConfig`; deterministic equity ordering. | ambiguity found in §P5 review |
 | **§17, §18, §19** | New: testing architecture, proof of determinism, architectural decisions log. | — |
+| **C-3.1, C-4.2a, C-4.8, C-4.14, C-9.7** | **AMENDED (market-fill admissibility).** New: the crossed-stop guard for market fills, the one-tick sub-tick floor, two fill-refusal reasons, `tick_reference`. `R_unit` (C-9.6/R-16) and C-4.1's `_pre_crossed` are explicitly unchanged. | fill-admissibility audit; R-21, R-22 |
 
 ---
 
@@ -198,8 +199,19 @@ a thesis with a live trade supersedes it (C-4.6/C-4.7).
 | `INVALID_LEVELS` | Rejected before any walk | C-4.14 | **yes** |
 | `OPEN` | Reporting label, not a state | Data ends while PENDING or ACTIVE | no |
 
-`NOT_FILLED` carries
-`cancel_reason ∈ {KILL, DECAY, TTL, REPLACED, SUPERSEDED, SHADOW_WINDOW}`.
+`NOT_FILLED` carries `cancel_reason` from two disjoint families:
+
+- **lifecycle cancellations** (C-4.8) — `{KILL, DECAY, TTL, REPLACED,
+  SUPERSEDED, SHADOW_WINDOW}`, all originating outside the walk;
+- **fill refusals** (C-4.2a, C-4.14) — `{STOP_REACHED_AT_FILL, SUB_TICK_RISK}`,
+  the walk's own finding that the order was not placeable at the execution
+  instant. No lifecycle event occurred, so these are *not* cancellations; they
+  share `NOT_FILLED` because that is where the contract records "why this
+  decision never became a trade".
+
+A fill refusal is **not** `INVALID_LEVELS`: the frozen levels are internally
+sound in both cases, and what fails is admissibility of the *fill*.
+
 **`BREAKEVEN` is not a state** — V2 has no BE logic; BE is a derived reporting
 bucket (`|realized_r| < 0.1`). **`PARTIAL` does not exist** — V2 has no partial
 exits.
@@ -291,6 +303,36 @@ It is **prohibited** to fill at `open(W1)` (a full hour of invented delay) or at
 outcome record. Consequence: realized R is computed from the actual fill, so
 **structural RR ≠ realized RR** — both are recorded (C-9.4, C-9.6).
 
+### C-4.2a Market-fill admissibility — the crossed stop (new)
+
+C-4.1's pre-crossed rule refuses to model patience for a limit already at or
+through market. A CONTINUATION fills at market at `open(W0)`, which **is** the
+decision instant — `boundary == h1_last_ts + 3600`, verified on every record of
+the frozen run — so the same principle applies to it, and until this clause the
+market branch had no equivalent guard.
+
+A CONTINUATION market fill is **inadmissible** when the stop has already been
+reached at the fill price:
+
+- LONG — `fill_price <= sl`;
+- SHORT — `fill_price >= sl`.
+
+Equality is inadmissible: a stop exactly at the fill has no risk unit at all,
+which C-9.6 refuses one step later. The trade does not fill; the walk yields
+terminal `NOT_FILLED(STOP_REACHED_AT_FILL)`.
+
+The guard needs no market metadata and therefore always applies. **C-4.1 is
+unchanged**: `_pre_crossed` continues to govern RETRACEMENT against
+`close(C_ref)`, and no limit fill is affected by this clause.
+
+Rationale, and why it is not a filter: an order whose stop the market has already
+passed could not have been placed. Admitting it produces arithmetic that is
+correct and meaningless — the 221 such fills in the scored population of the
+`39761eb79ae5432e` dataset were **all** `GAP_SL` at `holding_candles = 1` with
+`realized_r` exactly `0.000`, contributing **+0.00 gross R** while carrying
+23.7% of book-wide modelled friction, because `fee / R_unit` grows without bound
+as `R_unit` shrinks.
+
 ### C-4.3 SL/TP resolution while ACTIVE — AMENDED in v1.1
 
 Walk forward candle by candle from the fill candle onward. In each candle: LONG —
@@ -352,7 +394,15 @@ diverge — the trade is the alert's frozen copy (C-1.3).
 ### C-4.8 Pre-fill cancellations (entry lifetime)
 
 **The lifecycle IS the order-lifetime model** — no separate order TTL is invented.
-A `PENDING` trade is cancelled when its thesis is evicted:
+A `PENDING` trade is cancelled when its thesis is evicted.
+
+This clause enumerates the **lifecycle** family only. The walk's own fill
+refusals — `STOP_REACHED_AT_FILL` (C-4.2a) and `SUB_TICK_RISK` (C-4.14) — also
+resolve `NOT_FILLED` but originate here in the walk, not in an eviction, and are
+disjoint from the reasons below (C-3.1). Where both could apply, the refusal is
+reported: C-4.13 already evaluates every candle that could still fill *before* a
+cancellation deadline, so a cancellation that beat the fill leaves no refusal to
+report.
 
 | Lifecycle event | Trade result | Attribution source |
 |---|---|---|
@@ -425,6 +475,44 @@ emits inverted levels that still pass `levels_valid`
 ([rules.py:76](v2/lifecycle/rules.py#L76), which checks positivity and distinctness
 but not side) — see finding A36. The count is therefore a strategy-health signal,
 not dead code.
+
+**Sub-tick risk floor (new).** `R_unit > 0` is necessary but not sufficient. A
+fill is additionally **inadmissible** when
+
+```
+|fill_price − sl| < tickSize(symbol, tick_reference)
+```
+
+because a stop nearer the fill than one increment of the exchange's price grid is
+not a *small* risk but an **unrepresentable** one: no order could rest there.
+Exactly one tick is admissible; the floor is one tick and never wider. The result
+is terminal `NOT_FILLED(SUB_TICK_RISK)` — not `INVALID_LEVELS`, since the frozen
+levels remain internally sound.
+
+The floor applies to **every** fill kind, because representability is a property
+of the price grid rather than of how the order was routed. No RETRACEMENT fill in
+the `39761eb79ae5432e` dataset is affected, which is asserted as a regression.
+
+**`tick_reference` (C-9.7).** `tickSize` comes from one named, committed
+`exchangeInfo` artifact, whose id is an `OutcomeConfig` field and therefore
+segments every dataset derived under it. Binance serves `exchangeInfo` for the
+*current* state only, so **no historical tick size exists or can be recovered**
+for the corpus window; the floor is defined as an exchange-grid representability
+rule evaluated against the **declared reference snapshot**, and makes no claim
+about the grid at trade time. Naming the snapshot in the hash is what keeps that
+honest: a future historical source becomes a hash change, never a silent
+re-interpretation of records already on disk.
+
+**Missing tick.** A symbol absent from the reference — eleven of the 563 traded
+symbols, delisted or renamed before any snapshot exists to hold them — leaves the
+floor **unevaluated**. No fallback tick is invented. The fill is admitted if
+C-4.2a passes, and the record carries `tick_size_unavailable = true` so that
+"the floor did not run here" is distinguishable in the data from "the floor ran
+and the fill passed".
+
+**`R_unit` is unchanged.** C-9.6's `R_unit = |fill_price − sl|` and R-16's
+rationale both stand; this clause governs which fills are admitted, never how a
+risk unit is measured once one is.
 
 ---
 
@@ -1158,7 +1246,10 @@ realized_r    = (exit_price - fill_price) / R_unit        # LONG
 - `R_unit` uses the **fill price**, not `entry_price`. A CONTINUATION trade filled
   at `open(W0)` genuinely risks `|fill − sl|`; using the structural entry would
   report a risk the operator never had.
-- `R_unit == 0` or non-finite ⇒ terminal `INVALID_LEVELS` (C-4.14).
+- `R_unit == 0` or non-finite ⇒ terminal `INVALID_LEVELS` (C-4.14). A *positive*
+  `R_unit` below one tick of the price grid is a separate matter and is refused
+  earlier, as an inadmissible fill (C-4.14 sub-tick floor), so it never reaches
+  this arithmetic. The definition of `R_unit` itself is unchanged by that clause.
 - `structural_rr` is recorded alongside `realized_r` precisely so the gap between
   advertised and achievable RR is measurable (§12).
 - `mae_r` (≤ 0) and `mfe_r` (≥ 0) are the worst adverse and best favourable
@@ -1188,6 +1279,7 @@ field is an amendment.
 | `shadow_pending_h1` | `3` | fixed window for suppressed shadow classes (C-2.2) |
 | `burn_in_h1` | `336` | lifecycle burn-in (C-5.7) |
 | `equity_convention` | `"1R"` | per-trade unit for drawdown (C-9.8) |
+| `tick_reference` | `None` | committed `exchangeInfo` artifact id supplying `tickSize` for C-4.14's sub-tick floor; `None` leaves the floor unevaluated |
 
 ```
 outcome_config_hash = sha256(canonical_json(config))[:16]
@@ -1873,7 +1965,9 @@ they are not silently reopened.
 | **R-13** | Nine lineage fields; no more. | Also add `scan_instant`, `signal_id`, outcome fields. | `recorded_at` + `cycle_index` already determine the cycle instant; durable signal identity (finding A29) is a separate concern; outcomes must stay out of the ledger (C-9.5). |
 | **R-14** | Baseline is a **single unsharded run** with a 336-H1 burn-in. | Parallel shards for the baseline. | Shard boundaries reset lifecycle memory, changing slot-cap outcomes. Sharding remains available for exploration only. |
 | **R-15** | Three explicit shadow classes with a fixed 3-H1 window for the suppressed ones (C-2.2). | One undifferentiated "shadow" population (v1.0). | v1.0 both defined shadows as *insertions without an alert* and included CAPPED, which produces **no** insertion — a contradiction. Splitting the classes also makes the slot-cap and cooldown costs directly measurable. |
-| **R-16** | `R_unit` = `|fill_price − sl|` (C-9.6). | `|entry_price − sl|` (structural risk). | The operator's actual risk is measured from the actual fill; using the structural entry would report a risk nobody took. `structural_rr` is recorded separately so the gap is visible. |
+| **R-16** | `R_unit` = `|fill_price − sl|` (C-9.6). | `|entry_price − sl|` (structural risk). | The operator's actual risk is measured from the actual fill; using the structural entry would report a risk nobody took. `structural_rr` is recorded separately so the gap is visible. **Re-affirmed** when C-4.2a/C-4.14 were added: the pathology those clauses remove is inadmissible *fills*, not a mis-specified risk unit, and re-basing R on `entry_price` was rejected a second time for R-16's original reason. |
+| **R-21** | A fill refused by C-4.2a/C-4.14 is `NOT_FILLED` with its own reason. | Reuse `INVALID_LEVELS`, or reuse a lifecycle `cancel_reason`. | `INVALID_LEVELS` means the frozen geometry is impossible; here it is sound and the *fill* is not placeable. A lifecycle reason would claim an eviction that never happened. Two distinct reasons rather than one so a study can segment the crossed stop from the unrepresentable one. |
+| **R-22** | The sub-tick floor is exactly **one tick**, from a named snapshot. | A wider floor (2, 5, 10 ticks), or a floor fitted to observed expectancy. | One tick is the exchange's own price grid — external, and not derived from any result. Wider floors were declined despite the 2–5 tick band carrying 11.6% of modelled friction, because no external rule justifies them. A missing tick is declared, never defaulted. |
 | **R-17** | Universe tie-break by **symbol name**, ranking requires 24 closed H1 rows. | Preserve live's API-response tie order; rank on partial sums. | API order is not reproducible; partial sums make a new listing's universe entry depend on the window's start date. |
 | **R-18** | Capture events are **buffered per cycle** and flushed at `end_cycle`. | Stream events as they occur. | `seq`, `universe_rank` and the TTL residue all need cycle-complete information; streaming would require a second pass or a partial schema. |
 | **R-19** | `.npy` + JSON sidecar for klines; JSONL for records; SQLite only for small derived tables. | Parquet everywhere. | `pyarrow`/`fastparquet` are **not installed** and a new dependency needs approval; the hot path (1.3 M window reads) wants zero parse cost, which memory-mapped `.npy` provides. Parquet stays available for interchange if the dependency is approved. |

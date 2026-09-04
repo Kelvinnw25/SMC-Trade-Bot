@@ -46,6 +46,7 @@ from backtest.lineage import (
 from backtest.outcome.config import OutcomeConfig
 from backtest.outcome.errors import OutcomeError
 from backtest.outcome.record import OUTCOME_SCHEMA_VERSION, OutcomeRecord
+from backtest.outcome.ticks import TickTable, load_tick_table
 from backtest.outcome.trade import TradeIntent
 from backtest.outcome.walker import Resolution, WalkCounters, resolve_walk
 from v2.app.ledger import CONTRACT_VERSION
@@ -116,10 +117,32 @@ class OutcomeEngine:
         self._env = environment()
         self._config_hash = self._config.config_hash
         self._lineage = lineage if lineage is not None else RunLineage()
+        self._ticks = self._load_ticks()
+
+    def _load_ticks(self) -> Optional[TickTable]:
+        """C-4.14's price grid, resolved from `config.tick_reference`.
+
+        The reference lives beside the kline repository, in the sibling
+        `reference/` tree the corpus builder commits it to. A named reference
+        that cannot be found is an error rather than a silent skip: the name is
+        already inside `outcome_config_hash`, so proceeding without it would
+        stamp records with a grid that was never applied.
+        """
+        if self._config.tick_reference is None:
+            return None
+        root = Path(self._repo.root)
+        return load_tick_table(
+            self._config.tick_reference,
+            roots=(root.parent / "reference", root / "reference", root))
 
     @property
     def config(self) -> OutcomeConfig:
         return self._config
+
+    @property
+    def ticks(self) -> Optional[TickTable]:
+        """The loaded price grid, or `None` when no reference is configured."""
+        return self._ticks
 
     @property
     def lineage(self) -> RunLineage:
@@ -159,7 +182,8 @@ class OutcomeEngine:
         """One trade, one record. Pure with respect to the repository."""
         tally = counters if counters is not None else WalkCounters()
         resolution = resolve_walk(
-            intent, repository=self._repo, config=self._config, counters=tally)
+            intent, repository=self._repo, config=self._config, counters=tally,
+            ticks=self._ticks)
         return self._record(intent, resolution)
 
     def resolve_all(self, intents: Iterable[TradeIntent]) -> OutcomeReport:
@@ -260,6 +284,7 @@ class OutcomeEngine:
             burn_in_h1=self._lineage.burn_in_h1,
             universe_mode=self._lineage.universe_mode,
             signal_id=intent.signal_id,
+            tick_size_unavailable=resolution.tick_size_unavailable,
         )
 
 

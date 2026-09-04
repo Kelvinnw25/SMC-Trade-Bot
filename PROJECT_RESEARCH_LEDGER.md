@@ -43,14 +43,14 @@ Confidence: **High** = replicated across independent partitions with adequate po
 ### Continuation
 - **Tested:** trend persistence, repeatedly, and most recently under a drift-adjusted null.
 - **Method:** mode-level partition; then per-direction; then drift-adjusted first-passage benchmark (2026-08-14).
-- **Result:** driftless Δ +0.0036 (≈1σ, n=19,691). **Drift-adjusted Δ ≈ +0.0201**, with SHORT +0.0305 (5.24σ) and LONG +0.0143 (3.41σ).
+- **Result:** driftless Δ +0.0036 (≈1σ, n=19,691). **Drift-adjusted Δ ≈ +0.0201**, with SHORT +0.0305 (5.24σ) and LONG +0.0143 (3.41σ). **⚠ Superseded by §4b (2026-08-15): under the fill-based null, driftless Δ +0.0073 (+2.06σ, n=18,505); drift-adjusted SHORT +0.0383, LONG +0.0153.**
 - **Conclusion:** the strongest premise in the project. Two-sided once drift is controlled, contrary to the earlier short-only reading. Still small, still concentrated in market-drawdown months, still negative at taker fees.
 - **Confidence: Medium.**
 
 ### Retracement
 - **Tested:** pullback-into-zone entry.
 - **Method:** mode partition, n = 11,518; adverse-resolution bias bounded at 1.38%.
-- **Result:** **Δ = −0.0386 (≈9σ)**, E −0.0511, −588 R. RETR×LONG −0.0539 (≈9.7σ), −663 R. Negative in 2023/24/25; positive only in DEV 2026. Replicated on the CAPPED population (Δ −0.0250, −3.57σ for CONT×LONG mirror).
+- **Result:** **Δ = −0.0386 (≈9σ)**, E −0.0511, −588 R. RETR×LONG −0.0539 (≈9.7σ), −663 R. **⚠ Superseded by §4b (2026-08-15): the nine-sigma result was substantially a benchmark artifact. Under the fill-based null Δ = −0.0074 (−1.78σ); drift-adjusted, RETR×LONG −0.0007 (−0.14σ). The R-space losses (E −0.0511, −588 R) are unchanged and remain real.** Negative in 2023/24/25; positive only in DEV 2026. Replicated on the CAPPED population (Δ −0.0250, −3.57σ for CONT×LONG mirror).
 - **Decomposition:** the loss is concentrated in `IMMEDIATE` fills — entries taken after price already traded through the zone — Δ −0.0917 on n=4,651. Clean first touches are at zero (see Order blocks).
 - **Conclusion:** the only statistically overwhelming effect in the dataset, and its sign is negative. Jointly attributable with the OB definition; not separable.
 - **Confidence: High.**
@@ -176,8 +176,8 @@ Evidence currently rejects these. Do not re-open without new data or a new mecha
 
 ## 4 · Supported Findings
 
-1. **The system carries no net directional information under the original benchmark.** Overall Δ −0.0120 vs the geometric null; win rate 32.21% against a 32.50% breakeven. **High.**
-2. **Continuation beats retracement**, and after drift adjustment continuation is positive on both sides (Δ ≈ +0.0201; SHORT +0.0305, LONG +0.0143). **Medium.**
+1. **The system carries no net directional information under the original benchmark.** Overall Δ −0.0120 vs the geometric null; win rate 32.21% against a 32.50% breakeven. **High.** **⚠ §4b: corrected to +0.0017 (+0.64σ) — still no net information, but the sign flipped and the magnitude was benchmark error.**
+2. **Continuation beats retracement**, and after drift adjustment continuation is positive on both sides (Δ ≈ +0.0201; SHORT +0.0305, LONG +0.0143). **Medium.** **⚠ §4b: the ordering survives, but most of the gap was benchmark error — corrected, CONTINUATION +0.0073 vs RETRACEMENT −0.0074.**
 3. **Entering a level price has already breached is destructive** — Δ −0.0917 on n=4,651 versus −0.0026 for clean first touches. **High.**
 4. **A fixed 2R target beats every liquidity-derived target**, in both directions, within mode. **High.**
 5. **Planned RR and hit rate trade off unfavourably** — RR ≥3.0 is −522 R. **High.**
@@ -186,6 +186,65 @@ Evidence currently rejects these. Do not re-open without new data or a new mecha
 8. **Over-sizing dominates bad edge at current turnover** — at 1%/trade the variance drag (4.035) exceeds the negative drift term (2.727). **High.**
 9. **Market state explains ~29% of monthly expectancy variation** (best single covariate: universe median return, R² 0.267). **Medium.**
 10. **Effects are concentrated in market-drawdown months**: CONT×SHORT Δ +0.0726 (drift-adjusted) when BTC < −10%, versus +0.014 in flat months. **High.**
+
+---
+
+## 4b · Benchmark Correction — D5 Diff (2026-08-15)
+
+`BENCHMARK_FIX_SPEC.md` v4 implemented. The null is now priced from `fill_price`
+(`effective_rr = |tp − fill| / |fill − sl|`) rather than from the planned entry. The walker,
+the engine, `OutcomeConfig` and every frozen metric are untouched; the correction lives
+entirely in `backtest/analytics/studies/fill_null.py`, which is opt-in and registers nothing
+into `HEADLINE`. Official baseline digest verified unchanged before and after
+(`metrics_hash e7f124530b16437d`).
+
+**Estimand:** conditional on a completed two-barrier race under system rules. Population
+`barrier_resolved`; `no_race` removed at source. All figures below are **benchmark-consistent,
+not edge estimates.**
+
+| finding | before | after | cause |
+|---|---|---|---|
+| Overall Δ vs null | −0.0120 | **+0.0017 (+0.64σ)** | benchmark + population |
+| CONTINUATION Δ (driftless) | +0.0036 | **+0.0073 (+2.06σ)** | benchmark + population |
+| RETRACEMENT Δ (driftless) | **−0.0386 (≈9σ)** | **−0.0074 (−1.78σ)** | benchmark |
+| CONT×SHORT Δ (drift-adj) | +0.0305 (5.24σ) | **+0.0383 (+6.33σ)** | benchmark |
+| CONT×LONG Δ (drift-adj) | +0.0143 (3.41σ) | **+0.0153 (+3.50σ)** | benchmark |
+| RETR×LONG Δ (drift-adj) | −0.0539 (≈9.7σ) | **−0.0007 (−0.14σ)** | benchmark |
+| RETR×SHORT Δ (drift-adj) | −0.0210 | **+0.0024 (+0.36σ)** | benchmark |
+| CONTINUATION as-traded n | 19,691 | **19,063** | population (`no_race`) |
+| CONTINUATION as-traded E[R] | +0.01602 | **+0.01655** | population; total R +315.47 unchanged |
+
+**What moved and why.** The correction is not uniform: it moves CONTINUATION **down**
+(−0.0120) and RETRACEMENT **up** (+0.0344), because market entries chase (+0.083 R adverse)
+while limit entries improve (−0.109 R favourable). The single largest change in the project's
+history of findings is RETRACEMENT: *the −0.0386 nine-sigma negative result was substantially an
+artifact of comparing limit fills against a planned-entry null.* Under the corrected benchmark
+it is −0.0074 (−1.78σ), and drift-adjusted it is indistinguishable from zero on both sides.
+
+**Sensitivity bounds** (§B5 `no_race`, §B6 censoring — diagnostics, never primary, never
+combined). CONT×SHORT Δ +0.0400 survives both: `no_race` [+0.0253, +0.0601], censoring
+[+0.0296, +0.0568]. CONT×LONG Δ −0.0108 spans zero under both. RETRACEMENT has `no_race` n=0,
+so those columns are `null`, not a repeated primary.
+
+**Verification.** D0 38/38 (authoritative). D1 independent reimplementation agreed to 0.0e+00.
+D2 `LIMIT_TOUCH` invariance exact on 6,864/6,864 rows, Δ difference 0.0 — the correction is
+provably inert where fill equals planned entry. `no_race` census: CONTINUATION 628,
+RETRACEMENT 0, matching the spec. All `HTF_KILL`/`MAX_HOLDING` rows verified `barrier_eligible`.
+
+**Not re-derived.** Anything conditioned on a partition that has not itself been recomputed —
+notably finding 10 (episode-month bands) and the monthly sign tests — still carries the
+planned-entry null. They are contaminated and pending.
+
+**Out of scope, recorded (§H).** Shadow populations were descoped. Two artifacts are missing:
+(a) a shadow-capable loader — `labelled_trades()` filters `shadow_kind is not None` out upstream
+via `Populations.scored`, so the studies layer structurally cannot see a shadow record; and
+(b) a committed volume matcher — none exists under `backtest/`; the prior matched control was
+ad-hoc and uncommitted. Until both exist, **no shadow-population claim may be made under the
+corrected benchmark.** The CAPPED replication cited in §1 Retracement is therefore not
+re-derived and remains on the old null.
+
+**No production decision follows from this section.** Continuation's fate was explicitly
+deferred until after the benchmark fix and remains undecided.
 
 ---
 

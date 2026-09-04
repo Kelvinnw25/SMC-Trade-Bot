@@ -438,9 +438,23 @@ def _outcome(args: argparse.Namespace) -> int:
     intents = build_trade_intents(args.run)
     engine = OutcomeEngine.for_run(
         repository, args.run,
-        config=OutcomeConfig(max_holding_h1=args.max_holding))
-    report = engine.write(intents.intents, args.run, overwrite=args.overwrite)
+        config=OutcomeConfig(max_holding_h1=args.max_holding,
+                             tick_reference=args.tick_reference))
+    destination = args.out if args.out is not None else args.run
+    report = engine.write(intents.intents, destination,
+                          overwrite=args.overwrite)
+    reasons: dict[str, int] = {}
+    for record in report.records:
+        if not record.filled and record.cancel_reason:
+            reasons[record.cancel_reason] = (
+                reasons.get(record.cancel_reason, 0) + 1)
     _emit({"trades": len(report), "states": report.states,
+           "cancel_reasons": dict(sorted(reasons.items())),
+           "filled": sum(1 for r in report.records if r.filled),
+           "unfilled": sum(1 for r in report.records if not r.filled),
+           "tick_size_unavailable": sum(
+               1 for r in report.records if r.tick_size_unavailable),
+           "outcome_config_hash": report.config_hash,
            "lineage": engine.lineage.to_dict(),
            "counters": report.counters.to_dict()})
     return 0
@@ -1010,6 +1024,14 @@ def build_parser() -> argparse.ArgumentParser:
     outcome.add_argument("--max-holding", type=int, default=168,
                          dest="max_holding")
     outcome.add_argument("--overwrite", action="store_true")
+    outcome.add_argument(
+        "--tick-reference", default=None,
+        help="committed exchangeInfo artifact id supplying tickSize for "
+             "C-4.14's sub-tick floor; omitted leaves the floor unevaluated")
+    outcome.add_argument(
+        "--out", type=Path, default=None,
+        help="write outcomes.jsonl here instead of into --run, so a "
+             "re-derivation can be compared against a frozen one")
     outcome.set_defaults(func=_outcome)
 
     # -- metrics ---------------------------------------------------------
